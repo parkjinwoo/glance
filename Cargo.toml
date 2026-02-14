@@ -1,0 +1,36 @@
+[workspace]
+members = [
+  "crates/glance-app",
+  "crates/glance-config",
+  "crates/glance-net",
+  "crates/glance-dom",
+  "crates/glance-render",
+  "crates/glance-js",
+  "crates/glance-media",
+  "crates/glance-ui",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+authors = ["Glance Contributors"]
+
+[workspace.dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+toml = "0.9"
+url = "2"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "charset", "http2", "cookies", "gzip", "brotli", "deflate"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+scraper = "0.24"
+ratatui = "0.29"
+crossterm = "0.29"
+clap = { version = "4", features = ["derive"] }
+thiserror = "2"
+dirs = "6"
+regex = "1"
+base64 = "0.22"
+imagesize = "0.13"
+unicode-width = "0.2"

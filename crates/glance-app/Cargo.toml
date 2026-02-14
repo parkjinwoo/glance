@@ -1,0 +1,22 @@
+[package]
+name = "glance-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "glance"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+tokio.workspace = true
+url.workspace = true
+glance-config = { path = "../glance-config" }
+glance-net = { path = "../glance-net" }
+glance-dom = { path = "../glance-dom" }
+glance-render = { path = "../glance-render" }
+glance-js = { path = "../glance-js" }
+glance-media = { path = "../glance-media" }
+glance-ui = { path = "../glance-ui" }

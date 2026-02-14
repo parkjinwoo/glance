@@ -1,0 +1,14 @@
+[package]
+name = "glance-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+ratatui.workspace = true
+crossterm.workspace = true
+url.workspace = true
+unicode-width.workspace = true
+glance-render = { path = "../glance-render" }
+glance-media = { path = "../glance-media" }
