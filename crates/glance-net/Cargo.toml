@@ -7,4 +7,9 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 reqwest.workspace = true
+reqwest_cookie_store.workspace = true
+cookie_store.workspace = true
+encoding_rs.workspace = true
+tokio.workspace = true
 url.workspace = true
+tempfile.workspace = true

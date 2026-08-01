@@ -1,5 +1,5 @@
 use std::io::{Write, stdout};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
@@ -12,6 +12,12 @@ use url::Url;
 pub enum ExternalPlayerLaunchMode {
     Sync,
     Spawn,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum ExternalPlayerOutcome {
+    Completed,
+    Spawned { pid: u32 },
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -134,6 +140,7 @@ pub fn render_inline_image_at(
 }
 
 fn ensure_kitty_png_payload(image_bytes: &[u8]) -> Result<Vec<u8>, String> {
+    validate_image_decode_dimensions(image_bytes)?;
     const PNG_SIG: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
     if image_bytes.starts_with(&PNG_SIG) {
         return Ok(image_bytes.to_vec());
@@ -146,6 +153,27 @@ fn ensure_kitty_png_payload(image_bytes: &[u8]) -> Result<Vec<u8>, String> {
     img.write_to(&mut cursor, ImageFormat::Png)
         .map_err(|e| format!("failed to transcode image for kitty backend: {e}"))?;
     Ok(png)
+}
+
+fn validate_image_decode_dimensions(image_bytes: &[u8]) -> Result<(), String> {
+    const MAX_DIMENSION: usize = 32_768;
+    const MAX_PIXELS: usize = 32_000_000;
+
+    let size = imagesize::blob_size(image_bytes)
+        .map_err(|error| format!("could not inspect image dimensions: {error}"))?;
+    let pixels = size.width.saturating_mul(size.height);
+    if size.width == 0
+        || size.height == 0
+        || size.width > MAX_DIMENSION
+        || size.height > MAX_DIMENSION
+        || pixels > MAX_PIXELS
+    {
+        return Err(format!(
+            "image dimensions are too large to decode safely ({}x{})",
+            size.width, size.height
+        ));
+    }
+    Ok(())
 }
 
 pub fn clear_inline_image(placement: InlineImagePlacement) -> Result<(), String> {
@@ -234,7 +262,8 @@ fn clear_iterm2(placement: InlineImagePlacement) -> Result<(), String> {
 }
 
 pub fn launch_external_player(player: &str, media_url: &Url) -> Result<(), String> {
-    launch_external_player_with_options(player, media_url, ExternalPlayerLaunchMode::Sync, &[])
+    launch_external_player_with_options(player, media_url, ExternalPlayerLaunchMode::Sync, &[], &[])
+        .map(|_| ())
 }
 
 pub fn launch_external_player_with_options(
@@ -242,15 +271,11 @@ pub fn launch_external_player_with_options(
     media_url: &Url,
     mode: ExternalPlayerLaunchMode,
     allowed_players: &[String],
-) -> Result<(), String> {
+    player_args: &[String],
+) -> Result<ExternalPlayerOutcome, String> {
     let player = player.trim();
     if player.is_empty() {
         return Err("external player command is empty".to_string());
-    }
-    if player.contains(char::is_whitespace) {
-        return Err(
-            "external player must be a single executable name or path (no spaces)".to_string(),
-        );
     }
     if !allowed_players.is_empty() && !allowed_players.iter().any(|p| p == player) {
         return Err(format!(
@@ -259,7 +284,8 @@ pub fn launch_external_player_with_options(
     }
 
     let mut cmd = Command::new(player);
-    cmd.arg(media_url.as_str());
+    let args = build_player_arguments(player_args, media_url);
+    cmd.args(args);
 
     match mode {
         ExternalPlayerLaunchMode::Sync => {
@@ -267,24 +293,52 @@ pub fn launch_external_player_with_options(
                 .status()
                 .map_err(|e| format!("failed to launch player '{player}': {e}"))?;
             if status.success() {
-                Ok(())
+                Ok(ExternalPlayerOutcome::Completed)
             } else {
                 Err(format!("player exited with status: {status}"))
             }
         }
         ExternalPlayerLaunchMode::Spawn => {
-            cmd.spawn()
+            cmd.stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            let child = cmd
+                .spawn()
                 .map_err(|e| format!("failed to spawn player '{player}': {e}"))?;
-            Ok(())
+            Ok(ExternalPlayerOutcome::Spawned { pid: child.id() })
         }
     }
+}
+
+fn build_player_arguments(player_args: &[String], media_url: &Url) -> Vec<String> {
+    if player_args.is_empty() {
+        return vec![media_url.to_string()];
+    }
+
+    let mut replaced_url = false;
+    let mut args = player_args
+        .iter()
+        .map(|arg| {
+            if arg.contains("{url}") {
+                replaced_url = true;
+                arg.replace("{url}", media_url.as_str())
+            } else {
+                arg.clone()
+            }
+        })
+        .collect::<Vec<_>>();
+    if !replaced_url {
+        args.push(media_url.to_string());
+    }
+    args
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        ExternalPlayerLaunchMode, ImageBackend, compute_aspect_fit, detect_image_backend_from_env,
-        image_dimensions, launch_external_player_with_options,
+        ExternalPlayerLaunchMode, ImageBackend, build_player_arguments, compute_aspect_fit,
+        detect_image_backend_from_env, image_dimensions, launch_external_player_with_options,
+        validate_image_decode_dimensions,
     };
     use url::Url;
 
@@ -325,19 +379,26 @@ mod tests {
             0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
         ];
         assert_eq!(image_dimensions(&bytes), Some((1, 1)));
+        assert!(validate_image_decode_dimensions(&bytes).is_ok());
+
+        let mut oversized = bytes;
+        oversized[16..20].copy_from_slice(&100_000_u32.to_be_bytes());
+        oversized[20..24].copy_from_slice(&100_000_u32.to_be_bytes());
+        assert!(validate_image_decode_dimensions(&oversized).is_err());
     }
 
     #[test]
-    fn rejects_player_with_whitespace() {
+    fn rejects_empty_player() {
         let url = Url::parse("https://example.com/v.mp4").expect("url");
         let err = launch_external_player_with_options(
-            "mpv --fs",
+            "  ",
             &url,
             ExternalPlayerLaunchMode::Sync,
             &[],
+            &[],
         )
-        .expect_err("must reject whitespace");
-        assert!(err.contains("single executable"));
+        .expect_err("must reject empty player");
+        assert!(err.contains("empty"));
     }
 
     #[test]
@@ -348,8 +409,38 @@ mod tests {
             &url,
             ExternalPlayerLaunchMode::Sync,
             &["mpv".to_string()],
+            &[],
         )
         .expect_err("must reject not-allowed player");
         assert!(err.contains("not allowed"));
+    }
+
+    #[test]
+    fn builds_shell_free_player_arguments_with_url_placeholder() {
+        let url = Url::parse("https://example.com/v.mp4?a=1&b=2").expect("url");
+        let args = build_player_arguments(
+            &["--title=Glance".to_string(), "--playlist={url}".to_string()],
+            &url,
+        );
+        assert_eq!(
+            args,
+            vec![
+                "--title=Glance".to_string(),
+                "--playlist=https://example.com/v.mp4?a=1&b=2".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn appends_url_when_player_arguments_have_no_placeholder() {
+        let url = Url::parse("https://example.com/audio.opus").expect("url");
+        let args = build_player_arguments(&["--no-video".to_string()], &url);
+        assert_eq!(
+            args,
+            vec![
+                "--no-video".to_string(),
+                "https://example.com/audio.opus".to_string(),
+            ]
+        );
     }
 }

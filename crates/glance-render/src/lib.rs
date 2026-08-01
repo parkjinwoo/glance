@@ -24,6 +24,8 @@ pub enum InteractiveAction {
     OpenLink(usize),
     OpenImage(usize),
     OpenMedia(usize),
+    OpenForm(usize),
+    ActivateButton(usize),
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -33,17 +35,64 @@ pub enum RenderIconMode {
 }
 
 pub fn render_document(doc: &Document, icon_mode: RenderIconMode) -> RenderedPage {
-    let (mut lines, interactive_spans) = if doc.markdown_blocks.is_empty() {
+    let (body_lines, mut body_spans) = if doc.markdown_blocks.is_empty() {
         (render_fallback_text_lines(doc), Vec::new())
     } else {
         render_markdown_blocks(doc, icon_mode)
     };
 
+    let mut lines = Vec::new();
+    let mut interactive_spans = Vec::new();
+
     if !doc.forms.is_empty() {
-        lines.push(String::new());
-        lines.push("Forms:".to_string());
         for (i, form) in doc.forms.iter().enumerate() {
-            lines.push(format!("  [{}] {} {}", i + 1, form.method, form.action));
+            let token = interactive_token(InteractiveAction::OpenForm(i), i, icon_mode);
+            let required = form
+                .fields
+                .iter()
+                .find(|field| field.editable)
+                .is_some_and(|field| field.required);
+            let line = format!(
+                "{token} {}{}",
+                form.label,
+                if required { "  • required" } else { "" }
+            );
+            let line_idx = lines.len();
+            let line_width = UnicodeWidthStr::width(line.as_str()) as u16;
+            lines.push(line);
+            interactive_spans.push(InteractiveSpan {
+                line: line_idx,
+                col_start: 0,
+                col_end: line_width,
+                action: InteractiveAction::OpenForm(i),
+            });
+        }
+        lines.push(String::new());
+    }
+
+    let body_offset = lines.len();
+    for span in &mut body_spans {
+        span.line = span.line.saturating_add(body_offset);
+    }
+    lines.extend(body_lines);
+    interactive_spans.extend(body_spans);
+
+    if !doc.continuation_buttons.is_empty() {
+        if lines.last().is_some_and(|line| !line.is_empty()) {
+            lines.push(String::new());
+        }
+        for (i, button) in doc.continuation_buttons.iter().enumerate() {
+            let token = interactive_token(InteractiveAction::ActivateButton(i), i, icon_mode);
+            let line = format!("{token}  {}", button.label);
+            let line_idx = lines.len();
+            let line_width = UnicodeWidthStr::width(line.as_str()) as u16;
+            lines.push(line);
+            interactive_spans.push(InteractiveSpan {
+                line: line_idx,
+                col_start: 0,
+                col_end: line_width,
+                action: InteractiveAction::ActivateButton(i),
+            });
         }
     }
 
@@ -227,11 +276,15 @@ fn interactive_token(action: InteractiveAction, index: usize, icon_mode: RenderI
             InteractiveAction::OpenLink(_) => format!("󰌹{n}"),
             InteractiveAction::OpenImage(_) => format!("󰋩{n}"),
             InteractiveAction::OpenMedia(_) => format!("󰕧{n}"),
+            InteractiveAction::OpenForm(_) => format!("󰘎{n}"),
+            InteractiveAction::ActivateButton(_) => format!("󰐕{n}"),
         },
         RenderIconMode::Ascii => match action {
             InteractiveAction::OpenLink(_) => format!("[L{n}]"),
             InteractiveAction::OpenImage(_) => format!("[I{n}]"),
             InteractiveAction::OpenMedia(_) => format!("[M{n}]"),
+            InteractiveAction::OpenForm(_) => format!("[F{n}]"),
+            InteractiveAction::ActivateButton(_) => format!("[+{n}]"),
         },
     }
 }
@@ -326,6 +379,8 @@ mod tests {
                 <a href="/a">A</a>
                 <img src="/i.png" alt="img-a" />
                 <a href="/m.mp4">video</a>
+                <form action="/search"><input type="search" name="q"></form>
+                <button data-glance-continuation="7">Load more posts</button>
             </body></html>
         "#;
         let base = Url::parse("https://example.com").expect("url");
@@ -349,6 +404,24 @@ mod tests {
                 .interactive_spans
                 .iter()
                 .any(|s| matches!(s.action, InteractiveAction::OpenMedia(0)))
+        );
+        assert!(
+            rendered
+                .interactive_spans
+                .iter()
+                .any(|s| matches!(s.action, InteractiveAction::OpenForm(0)))
+        );
+        assert!(
+            rendered
+                .interactive_spans
+                .iter()
+                .any(|s| matches!(s.action, InteractiveAction::ActivateButton(0)))
+        );
+        assert!(
+            rendered
+                .lines
+                .iter()
+                .any(|line| line == "[+1]  Load more posts")
         );
     }
 

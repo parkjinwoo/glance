@@ -1,8 +1,0 @@
-[package]
-name = "glance-js"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
-
-[dependencies]
-url.workspace = true

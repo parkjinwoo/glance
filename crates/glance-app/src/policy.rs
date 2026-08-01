@@ -1,13 +1,16 @@
-use anyhow::{Result, bail};
-use url::{Host, Url};
+use anyhow::Result;
+use url::Url;
 
-use glance_config::{Config, ExternalPlayerMode as ConfigExternalPlayerMode};
+use glance_config::{
+    Config, DynamicMode as ConfigDynamicMode, ExternalPlayerMode as ConfigExternalPlayerMode,
+    ImageMode as ConfigImageMode,
+};
 use glance_media::ExternalPlayerLaunchMode;
+use glance_net::NetworkAccessPolicy;
 
 #[derive(Debug, Clone)]
 pub(crate) struct NetworkPolicy {
-    pub(crate) allowed_schemes: Vec<String>,
-    pub(crate) allow_private_ip: bool,
+    pub(crate) access: NetworkAccessPolicy,
     pub(crate) max_body_bytes: usize,
     pub(crate) max_image_bytes: usize,
     pub(crate) sanitize_control_chars: bool,
@@ -17,7 +20,25 @@ pub(crate) struct NetworkPolicy {
 pub(crate) struct MediaPolicy {
     pub(crate) player: String,
     pub(crate) mode: ExternalPlayerLaunchMode,
+    pub(crate) player_args: Vec<String>,
     pub(crate) allowed_players: Vec<String>,
+    pub(crate) images_enabled: bool,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) enum DynamicMode {
+    Off,
+    Manual,
+    Auto,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct DynamicPolicy {
+    pub(crate) mode: DynamicMode,
+    pub(crate) executable: Option<String>,
+    pub(crate) wait_ms: u64,
+    pub(crate) timeout_ms: u64,
+    pub(crate) security_compatible: bool,
 }
 
 pub(crate) fn normalize_scheme_list(input: &[String]) -> Vec<String> {
@@ -32,19 +53,8 @@ pub(crate) fn is_about_blank(url: &Url) -> bool {
     url.scheme().eq_ignore_ascii_case("about") && url.path().eq_ignore_ascii_case("blank")
 }
 
-pub(crate) fn validate_url_for_network(
-    url: &Url,
-    allowed_schemes: &[String],
-    allow_private_ip: bool,
-) -> Result<()> {
-    let scheme = url.scheme().to_ascii_lowercase();
-    if !allowed_schemes.iter().any(|s| s == &scheme) {
-        bail!("scheme '{}' is not allowed by config", url.scheme());
-    }
-    if !allow_private_ip && is_private_host(url) {
-        bail!("private or loopback target is blocked by config");
-    }
-    Ok(())
+pub(crate) fn validate_url_for_network(url: &Url, access: &NetworkAccessPolicy) -> Result<()> {
+    access.validate(url)
 }
 
 pub(crate) fn map_player_mode(mode: ConfigExternalPlayerMode) -> ExternalPlayerLaunchMode {
@@ -58,30 +68,36 @@ pub(crate) fn build_media_policy(config: &Config) -> MediaPolicy {
     MediaPolicy {
         player: config.media.external_player.clone(),
         mode: map_player_mode(config.media.external_player_mode),
+        player_args: config.media.external_player_args.clone(),
         allowed_players: config.media.allowed_players.clone(),
+        images_enabled: matches!(config.media.image_mode, ConfigImageMode::Auto),
     }
 }
 
-pub(crate) fn build_network_policy(config: &Config, allowed_schemes: Vec<String>) -> NetworkPolicy {
-    NetworkPolicy {
-        allowed_schemes,
-        allow_private_ip: config.security.allow_private_ip,
+pub(crate) fn build_dynamic_policy(config: &Config) -> DynamicPolicy {
+    DynamicPolicy {
+        mode: match config.dynamic.mode {
+            ConfigDynamicMode::Off => DynamicMode::Off,
+            ConfigDynamicMode::Manual => DynamicMode::Manual,
+            ConfigDynamicMode::Auto => DynamicMode::Auto,
+        },
+        executable: config.dynamic.executable.clone(),
+        wait_ms: config.dynamic.wait_ms,
+        timeout_ms: config.dynamic.timeout_ms,
+        // An external browser can load private subresources after a public navigation.
+        // Disable the bridge when the strict public-network policy is requested.
+        security_compatible: config.security.allow_private_ip,
+    }
+}
+
+pub(crate) fn build_network_policy(
+    config: &Config,
+    allowed_schemes: Vec<String>,
+) -> Result<NetworkPolicy> {
+    Ok(NetworkPolicy {
+        access: NetworkAccessPolicy::new(allowed_schemes, config.security.allow_private_ip)?,
         max_body_bytes: config.network.max_body_bytes,
         max_image_bytes: config.network.max_image_bytes,
         sanitize_control_chars: config.security.sanitize_control_chars,
-    }
-}
-
-fn is_private_host(url: &Url) -> bool {
-    match url.host() {
-        Some(Host::Ipv4(ip)) => ip.is_private() || ip.is_loopback() || ip.is_link_local(),
-        Some(Host::Ipv6(ip)) => {
-            ip.is_loopback()
-                || ip.is_unspecified()
-                || ip.is_unique_local()
-                || ip.is_unicast_link_local()
-        }
-        Some(Host::Domain(d)) => d.eq_ignore_ascii_case("localhost"),
-        None => false,
-    }
+    })
 }

@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Glance sign-in fixture</title>
+  </head>
+  <body>
+    <main>
+      <h1>Completing secure sign-in</h1>
+      <p>This fixture redirects through the same browser profile.</p>
+    </main>
+    <script>
+      localStorage.setItem('glance-fixture-authenticated', 'yes');
+      setTimeout(() => location.replace('companion_feed.html'), 300);
+    </script>
+  </body>
+</html>

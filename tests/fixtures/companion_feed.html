@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Glance live feed fixture</title>
+    <style>
+      body { font: 18px system-ui; max-width: 720px; margin: 0 auto; padding: 32px; }
+      article { min-height: 180px; border-bottom: 1px solid #ccc; padding: 24px 0; }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>Live feed</h1>
+      <a id="account" href="companion_auth.html">Sign in</a>
+    </header>
+    <main id="feed" aria-label="Live feed"></main>
+    <button id="more" type="button">Load more posts</button>
+    <script>
+      const account = document.querySelector('#account');
+      if (localStorage.getItem('glance-fixture-authenticated') === 'yes') {
+        account.textContent = 'Sign out';
+        account.href = '#sign-out';
+      }
+
+      const feed = document.querySelector('#feed');
+      let batch = 0;
+      let pending = false;
+      function appendBatch() {
+        batch += 1;
+        for (let item = 1; item <= 8; item += 1) {
+          const article = document.createElement('article');
+          article.innerHTML = `<h2>Batch ${batch} · item ${item}</h2><p>Unique live content ${batch}-${item}</p>`;
+          feed.append(article);
+        }
+      }
+      appendBatch();
+      document.querySelector('#more').addEventListener('click', appendBatch);
+      addEventListener('scroll', () => {
+        if (pending) return;
+        pending = true;
+        setTimeout(() => {
+          appendBatch();
+          pending = false;
+        }, 250);
+      }, {passive: true});
+    </script>
+  </body>
+</html>
