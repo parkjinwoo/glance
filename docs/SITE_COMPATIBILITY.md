@@ -1,14 +1,15 @@
 # Live-site compatibility audit
 
-Checked on 2026-08-01 against the public signed-out pages. These sites change independently of
-Glance, so this is a smoke-test record rather than a permanent guarantee.
+Checked on 2026-08-02 against public pages, plus a non-mutating authenticated Hackers' Pub DOM
+inspection. These sites change independently of Glance, so this is a smoke-test record rather than
+a permanent guarantee.
 
-| Site | Reading and navigation | Search | Sign-in | Media |
+| Site | Reading and navigation | Live interaction | Sign-in | Media |
 | --- | --- | --- | --- | --- |
-| Hackers' Pub | Automatic dynamic upgrade exposes the hydrated timeline and navigation | Link navigation | `/sign` opens in the secure companion; native WebAuthn supports platform passkeys and phone/tablet QR, then the authenticated DOM returns to the TUI | Images are extracted; linked playable media uses the media picker |
-| Naver | Automatic dynamic upgrade is requested for the partial `EAGER-DATA` shell | The hydrated search control is readable; the omnibox remains a reliable fallback | `nid.naver.com` is detected and opened in the secure companion | Ordinary Naver links are no longer mislabeled as media |
-| Google | The server page is usable without Chromium | The native GET search form is placed before page content | The Google Accounts URL is detected and opened in the secure companion | Images remain selectable; no false media entries |
-| YouTube | The serialized app shell is automatically upgraded to a hydrated DOM | Hydrated search UI is readable; the omnibox can navigate directly | Google Accounts sign-in is detected and opened in the secure companion | Only playable `/watch`, `/shorts`, `/live`, embed, or short URLs become stream items; home/about/legal links do not |
+| Hackers' Pub | Automatic dynamic upgrade exposes the hydrated timeline and navigation | Connected sessions expose the real reply textarea and submit control, short-post composer, language suggestions, visibility/image/poll controls, share/quote menus, reaction pickers, bookmark/options controls, and portal dialogs; mutating actions require confirmation | `/sign` opens in the secure companion; native WebAuthn supports platform passkeys and phone/tablet QR, then the authenticated DOM returns to the TUI | Images are extracted; linked playable media uses the media picker |
+| Naver | Automatic dynamic upgrade is requested for the partial `EAGER-DATA` shell; the hydrated search control is readable and the omnibox remains a reliable fallback | Visible supported controls are projected after a connected sign-in; site-specific transaction flows remain browser-owned | `nid.naver.com` is detected and opened in the secure companion | Ordinary Naver links are no longer mislabeled as media |
+| Google | The server page and native GET search form are usable without Chromium | Connected-session controls use the generic live-control bridge; account/security prompts remain in Chromium | The Google Accounts URL is detected and opened in the secure companion | Images remain selectable; no false media entries |
+| YouTube | The serialized app shell is automatically upgraded to a hydrated DOM; the omnibox can navigate directly | Connected-session visible menus and fields use the generic bridge; playback remains delegated to the media path | Google Accounts sign-in is detected and opened in the secure companion | Only playable `/watch`, `/shorts`, `/live`, embed, or short URLs become stream items; home/about/legal links do not |
 
 ## Authentication boundary
 

@@ -46,6 +46,45 @@ pub struct UiAuthItem {
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum UiLiveControlKind {
+    Disclosure,
+    Action,
+    Submit,
+    Field,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum UiLiveFieldKind {
+    Text,
+    TextArea,
+    Checkbox,
+    Radio,
+    Select,
+}
+
+#[derive(Debug, Clone)]
+pub struct UiLiveOption {
+    pub label: String,
+    pub value: String,
+    pub selected: bool,
+    pub disabled: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct UiLiveControlItem {
+    pub label: String,
+    pub context: Option<String>,
+    pub value: String,
+    pub placeholder: Option<String>,
+    pub kind: UiLiveControlKind,
+    pub field_kind: Option<UiLiveFieldKind>,
+    pub checked: bool,
+    pub options: Vec<UiLiveOption>,
+    pub requires_confirmation: bool,
+    pub multiline: bool,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum UiMediaKind {
     Audio,
     Video,
@@ -98,11 +137,13 @@ pub struct UiPage {
     pub image_mode: UiImageMode,
     pub links: Vec<UiResourceItem>,
     pub auth: Option<UiAuthItem>,
+    pub live_controls: Vec<UiLiveControlItem>,
     pub images: Vec<UiResourceItem>,
     pub media: Vec<UiMediaItem>,
     pub media_activity: Option<UiMediaActivity>,
     pub can_load_more: bool,
     pub loading_more: bool,
+    pub updating_live_controls: bool,
     pub selected_image_index: Option<usize>,
     pub selected_image_bytes: Option<Vec<u8>>,
     pub selected_image_size: Option<(u32, u32)>,
@@ -118,6 +159,9 @@ pub enum UiCommand {
     OpenLink(usize),
     SubmitForm(usize, String),
     ActivateButton(usize),
+    FillLiveField(usize, String),
+    ToggleLiveField(usize),
+    ActivateLiveControl(usize),
     OpenMedia(usize),
     SelectImage(usize),
     Reload,

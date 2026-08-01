@@ -14,8 +14,9 @@ use crate::app_state::{
     UiLayout,
 };
 use crate::draw::{
-    image_viewer_controls_rect, media_picker_layout, media_picker_rect, media_window_start,
-    sidebar_action_at,
+    control_confirmation_buttons, image_viewer_controls_rect, live_choice_options_rect,
+    live_choice_window_start, live_text_editor_buttons, media_picker_layout, media_picker_rect,
+    media_window_start, sidebar_action_at,
 };
 use crate::navigation::{
     clamp_content_scroll, clamp_cursor_to_terminal, content_action_at_click, cursor_target,
@@ -23,6 +24,8 @@ use crate::navigation::{
     page_move_cursor, set_cursor_from_screen_row,
 };
 use crate::{UiCommand, UiImageMode};
+
+const MAX_LIVE_FIELD_BYTES: usize = 64 * 1024;
 
 pub(crate) fn handle_key<F>(app: &mut App, key: KeyEvent, on_command: &mut F) -> Result<bool>
 where
@@ -33,6 +36,36 @@ where
     }
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
         return Ok(true);
+    }
+
+    if app.control_confirmation.is_some() {
+        match key.code {
+            KeyCode::Enter | KeyCode::Char('y' | 'Y') => {
+                confirm_live_control(app, on_command)?;
+            }
+            KeyCode::Esc | KeyCode::Char('n' | 'N' | 'q') => {
+                app.cancel_control_confirmation();
+                app.set_click_feedback("live action cancelled");
+            }
+            _ => {}
+        }
+        return Ok(false);
+    }
+
+    if app.live_choice_editor.is_some() {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                app.close_live_choice_editor();
+                app.set_click_feedback("selection cancelled");
+            }
+            KeyCode::Down | KeyCode::Char('j') => app.move_live_choice(1),
+            KeyCode::Up | KeyCode::Char('k') => app.move_live_choice(-1),
+            KeyCode::Home => app.move_live_choice_to_boundary(false),
+            KeyCode::End => app.move_live_choice_to_boundary(true),
+            KeyCode::Enter | KeyCode::Char(' ') => apply_live_choice(app, on_command)?,
+            _ => {}
+        }
+        return Ok(false);
     }
 
     if app.help_open {
@@ -130,6 +163,20 @@ fn handle_address_edit_mode<F>(app: &mut App, key: KeyEvent, on_command: &mut F)
 where
     F: FnMut(UiCommand) -> Result<crate::UiPage>,
 {
+    if let AddressMode::LiveField(index) = app.address_mode
+        && app
+            .page
+            .live_controls
+            .get(index)
+            .is_some_and(|control| control.multiline)
+        && key.code == KeyCode::Enter
+        && !key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::META)
+    {
+        insert_text(app, "\n");
+        return Ok(false);
+    }
     match key.code {
         KeyCode::Esc => {
             app.leave_address_edit();
@@ -146,6 +193,10 @@ where
             }
             if let AddressMode::Form(index) = mode {
                 super::apply_command(app, UiCommand::SubmitForm(index, cmd), on_command)?;
+                return Ok(false);
+            }
+            if let AddressMode::LiveField(index) = mode {
+                super::apply_command(app, UiCommand::FillLiveField(index, cmd), on_command)?;
                 return Ok(false);
             }
 
@@ -255,16 +306,81 @@ pub(crate) fn handle_paste(app: &mut App, text: &str) {
     if app.address_mode == AddressMode::Nav {
         return;
     }
-    let normalized = text.replace(['\r', '\n', '\t'], " ");
+    let multiline = if let AddressMode::LiveField(index) = app.address_mode {
+        app.page
+            .live_controls
+            .get(index)
+            .is_some_and(|control| control.multiline)
+    } else {
+        false
+    };
+    let normalized = if multiline {
+        text.replace("\r\n", "\n")
+            .replace('\r', "\n")
+            .replace('\t', "  ")
+    } else {
+        text.replace(['\r', '\n', '\t'], " ")
+    };
     insert_text(app, &normalized);
 }
 
+fn apply_live_choice<F>(app: &mut App, on_command: &mut F) -> Result<()>
+where
+    F: FnMut(UiCommand) -> Result<crate::UiPage>,
+{
+    let Some(editor) = app.live_choice_editor.clone() else {
+        return Ok(());
+    };
+    let Some(control) = app.page.live_controls.get(editor.control_index) else {
+        app.close_live_choice_editor();
+        app.set_click_feedback("selection is no longer available");
+        return Ok(());
+    };
+    let Some(option) = control.options.get(editor.selected_index) else {
+        app.set_click_feedback("no selectable option");
+        return Ok(());
+    };
+    if option.disabled {
+        app.set_click_feedback("this option is disabled");
+        return Ok(());
+    }
+
+    let index = editor.control_index;
+    let label = option.label.clone();
+    let value = option.value.clone();
+    app.close_live_choice_editor();
+    super::apply_command(app, UiCommand::FillLiveField(index, value), on_command)?;
+    app.set_click_feedback(format!("selected {label}"));
+    Ok(())
+}
+
+fn apply_live_text_edit<F>(app: &mut App, index: usize, on_command: &mut F) -> Result<()>
+where
+    F: FnMut(UiCommand) -> Result<crate::UiPage>,
+{
+    let value = app.command.clone();
+    app.leave_address_edit();
+    super::apply_command(app, UiCommand::FillLiveField(index, value), on_command)
+}
+
 fn insert_text(app: &mut App, text: &str) {
+    let mut insertion = text;
+    if matches!(app.address_mode, AddressMode::LiveField(_)) {
+        let available = MAX_LIVE_FIELD_BYTES.saturating_sub(app.command.len());
+        let mut end = text.len().min(available);
+        while end > 0 && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        insertion = &text[..end];
+        if insertion.len() < text.len() {
+            app.set_click_feedback("live field reached the 64 KiB editing limit");
+        }
+    }
     let byte_index = byte_index_at_char(&app.command, app.command_cursor);
-    app.command.insert_str(byte_index, text);
+    app.command.insert_str(byte_index, insertion);
     app.command_cursor = app
         .command_cursor
-        .saturating_add(text.chars().count())
+        .saturating_add(insertion.chars().count())
         .min(app.command.chars().count());
 }
 
@@ -457,6 +573,8 @@ fn action_url(app: &App, action: glance_render::InteractiveAction) -> Option<&st
         }
         glance_render::InteractiveAction::OpenForm(_) => None,
         glance_render::InteractiveAction::ActivateButton(_) => None,
+        glance_render::InteractiveAction::EditLiveField(_) => None,
+        glance_render::InteractiveAction::ActivateLiveControl(_) => None,
     }
 }
 
@@ -484,8 +602,39 @@ fn action_hover_text(app: &App, action: glance_render::InteractiveAction) -> Str
             "continuation button {} — load more live content",
             index + 1
         )),
+        glance_render::InteractiveAction::EditLiveField(index) => app
+            .page
+            .live_controls
+            .get(index)
+            .map(|control| format!("edit live field: {}", control.label)),
+        glance_render::InteractiveAction::ActivateLiveControl(index) => {
+            app.page.live_controls.get(index).map(|control| {
+                if control.requires_confirmation {
+                    format!("live action: {} — confirmation required", control.label)
+                } else {
+                    format!("open live control: {}", control.label)
+                }
+            })
+        }
     }
     .unwrap_or_else(|| "action unavailable".to_string())
+}
+
+fn confirm_live_control<F>(app: &mut App, on_command: &mut F) -> Result<()>
+where
+    F: FnMut(UiCommand) -> Result<crate::UiPage>,
+{
+    let Some(confirmation) = app.control_confirmation.take() else {
+        return Ok(());
+    };
+    let label = confirmation.label;
+    super::apply_command(
+        app,
+        UiCommand::ActivateLiveControl(confirmation.index),
+        on_command,
+    )?;
+    app.set_click_feedback(format!("confirmed {label}"));
+    Ok(())
 }
 
 fn copy_url(app: &mut App, url: String) -> Result<()> {
@@ -539,6 +688,113 @@ where
     let (w, h) = crossterm::terminal::size()?;
     let screen = Rect::new(0, 0, w, h);
     let layout = super::compute_layout(screen);
+
+    if app.control_confirmation.is_some() {
+        if matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left)) {
+            let (cancel, confirm) = control_confirmation_buttons(screen);
+            if super::point_in_rect(cancel, mouse.column, mouse.row) {
+                app.cancel_control_confirmation();
+                app.set_click_feedback("live action cancelled");
+            } else if super::point_in_rect(confirm, mouse.column, mouse.row) {
+                confirm_live_control(app, on_command)?;
+            }
+        }
+        return Ok(());
+    }
+
+    if app.live_choice_editor.is_some() {
+        if matches!(mouse.kind, MouseEventKind::ScrollDown) {
+            app.move_live_choice(1);
+        } else if matches!(mouse.kind, MouseEventKind::ScrollUp) {
+            app.move_live_choice(-1);
+        } else if matches!(mouse.kind, MouseEventKind::Moved) {
+            let options = live_choice_options_rect(screen);
+            if super::point_in_rect(options, mouse.column, mouse.row)
+                && let Some(editor) = app.live_choice_editor.as_ref()
+            {
+                let control_index = editor.control_index;
+                let window_start = app
+                    .page
+                    .live_controls
+                    .get(control_index)
+                    .map(|control| {
+                        live_choice_window_start(
+                            editor.selected_index,
+                            control.options.len(),
+                            options.height as usize,
+                        )
+                    })
+                    .unwrap_or(0);
+                let index = window_start + mouse.row.saturating_sub(options.y) as usize;
+                let selectable = app
+                    .page
+                    .live_controls
+                    .get(control_index)
+                    .and_then(|control| control.options.get(index))
+                    .is_some_and(|option| !option.disabled);
+                if selectable && let Some(editor) = &mut app.live_choice_editor {
+                    editor.selected_index = index;
+                }
+            }
+        } else if matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left)) {
+            let options = live_choice_options_rect(screen);
+            if super::point_in_rect(options, mouse.column, mouse.row) {
+                let Some(editor) = app.live_choice_editor.as_ref() else {
+                    return Ok(());
+                };
+                let control_index = editor.control_index;
+                let window_start = app
+                    .page
+                    .live_controls
+                    .get(control_index)
+                    .map(|control| {
+                        live_choice_window_start(
+                            editor.selected_index,
+                            control.options.len(),
+                            options.height as usize,
+                        )
+                    })
+                    .unwrap_or(0);
+                let index = window_start + mouse.row.saturating_sub(options.y) as usize;
+                let selectable = app
+                    .page
+                    .live_controls
+                    .get(control_index)
+                    .and_then(|control| control.options.get(index))
+                    .is_some_and(|option| !option.disabled);
+                if selectable {
+                    if let Some(editor) = &mut app.live_choice_editor {
+                        editor.selected_index = index;
+                    }
+                    apply_live_choice(app, on_command)?;
+                } else {
+                    app.set_click_feedback("this option is disabled");
+                }
+            } else {
+                app.close_live_choice_editor();
+                app.set_click_feedback("selection cancelled");
+            }
+        }
+        return Ok(());
+    }
+
+    if let AddressMode::LiveField(index) = app.address_mode {
+        if matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left)) {
+            let multiline = app
+                .page
+                .live_controls
+                .get(index)
+                .is_some_and(|control| control.multiline);
+            let (cancel, apply) = live_text_editor_buttons(screen, multiline);
+            if super::point_in_rect(cancel, mouse.column, mouse.row) {
+                app.leave_address_edit();
+                app.set_click_feedback("edit cancelled");
+            } else if super::point_in_rect(apply, mouse.column, mouse.row) {
+                apply_live_text_edit(app, index, on_command)?;
+            }
+        }
+        return Ok(());
+    }
 
     match mouse.kind {
         MouseEventKind::Moved => update_hover(app, screen, layout, mouse.column, mouse.row),
@@ -606,7 +862,10 @@ pub(crate) fn queue_scroll_delta(
     mouse: MouseEvent,
     acc: &mut ScrollAccumulator,
 ) -> Result<bool> {
-    if app.help_open {
+    if app.help_open
+        || app.live_choice_editor.is_some()
+        || matches!(app.address_mode, AddressMode::LiveField(_))
+    {
         return Ok(false);
     }
     let (w, h) = crossterm::terminal::size()?;

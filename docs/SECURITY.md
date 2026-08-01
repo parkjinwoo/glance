@@ -29,6 +29,26 @@ receives only the final URL and serialized DOM needed for terminal rendering.
   label allowlist. Existing page-supplied tags are cleared and only supported button roles are
   accepted. This is a guard against accidental activation, not an authorization boundary: a
   malicious site can lie about a button's label, so activate controls only on sites you trust.
+- General live controls exist only in an authenticated, connected companion session. Glance first
+  removes every page-supplied control tag, then marks visible supported fields and button roles
+  itself. Static responses and one-shot headless snapshots have these tags stripped, so server HTML
+  cannot opt itself into live execution.
+- Password, hidden, file, and other sensitive or unsupported inputs are not projected into the TUI.
+  Ordinary text/textarea values, checked state for native checkbox/radio inputs, and native
+  single-select options may be serialized into Glance's in-memory page model so they can be edited.
+  Custom comboboxes are exposed only through their browser-backed disclosure/listbox controls;
+  credentials and browser-owned security prompts remain inside Chromium.
+- A disclosure such as a menu, dialog, quote editor, reaction picker, or cancel control can be
+  opened directly. Generic actions and submit controls require a second explicit confirmation.
+  Immediately before editing or clicking, Glance re-resolves the companion-assigned identifier and
+  checks the expected kind and native field type, accessible label, visibility, enabled state,
+  current page, and origin. Select values must match a currently enabled option. Values and labels
+  are JSON-encoded before entering the fixed script rather than interpolated as executable
+  JavaScript. Visually hidden checkbox/radio inputs are accepted only when their associated label
+  is itself visible.
+- Confirmation prevents an accidental click; it is not an authorization boundary. A malicious
+  page controls its accessible labels and event handlers, and a click may have site-specific side
+  effects. Use live actions only on sites you trust and inspect the shown label and context.
 - Sign-in completion requires two consecutive observations on the same origin and path. Repeated
   activation focuses the existing authentication window, while input during authenticated return
   navigation is coalesced instead of starting another flow.

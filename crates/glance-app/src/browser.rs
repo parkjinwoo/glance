@@ -7,7 +7,9 @@ use tokio::runtime::Runtime;
 use url::Url;
 
 use glance_config::UiIconMode as ConfigUiIconMode;
-use glance_dom::{Document, Form, MediaKind, parse_document_with_options};
+use glance_dom::{
+    Document, Form, LiveControlKind, LiveFieldKind, MediaKind, parse_document_with_options,
+};
 use glance_media::{
     ExternalPlayerOutcome, ImageBackend, detect_image_backend, image_dimensions,
     launch_external_player_with_options,
@@ -15,8 +17,9 @@ use glance_media::{
 use glance_net::{FetchResult, NetClient, normalize_url, resolve_user_input};
 use glance_render::{RenderIconMode, RenderedPage, render_document};
 use glance_ui::{
-    UiAuthItem, UiCommand, UiIconMode, UiImageMode, UiMediaActivity, UiMediaItem, UiMediaKind,
-    UiMediaPhase, UiPage, UiResourceItem, UiWebMode,
+    UiAuthItem, UiCommand, UiIconMode, UiImageMode, UiLiveControlItem, UiLiveControlKind,
+    UiLiveFieldKind, UiLiveOption, UiMediaActivity, UiMediaItem, UiMediaKind, UiMediaPhase, UiPage,
+    UiResourceItem, UiWebMode,
 };
 
 use crate::companion::{
@@ -37,6 +40,7 @@ struct LoadedPage {
     url: Url,
     rendered: RenderedPage,
     document: Document,
+    can_scroll: bool,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -83,6 +87,12 @@ struct PendingCompanionScroll {
 
 #[derive(Debug, Clone)]
 struct PendingCompanionAction {
+    request_id: u64,
+    label: String,
+}
+
+#[derive(Debug, Clone)]
+struct PendingLiveControlAction {
     request_id: u64,
     label: String,
 }
@@ -190,6 +200,7 @@ pub(crate) struct Browser {
     inflight_companion_nav: Option<PendingCompanionNavigation>,
     inflight_companion_scroll: Option<PendingCompanionScroll>,
     inflight_companion_action: Option<PendingCompanionAction>,
+    inflight_live_control_action: Option<PendingLiveControlAction>,
     inflight_media: Option<PendingMedia>,
     last_external_launch: Option<(Url, Instant)>,
     companion: Option<CompanionClient>,
@@ -287,6 +298,7 @@ impl Browser {
             inflight_companion_nav: None,
             inflight_companion_scroll: None,
             inflight_companion_action: None,
+            inflight_live_control_action: None,
             inflight_media: None,
             last_external_launch: None,
             companion,
@@ -313,6 +325,9 @@ impl Browser {
             UiCommand::OpenAuth(raw) => self.open_auth(&raw),
             UiCommand::LoadMore => self.load_more(),
             UiCommand::ActivateButton(index) => self.activate_button(index),
+            UiCommand::FillLiveField(index, value) => self.fill_live_field(index, &value),
+            UiCommand::ToggleLiveField(index) => self.toggle_live_field(index),
+            UiCommand::ActivateLiveControl(index) => self.activate_live_control(index),
             UiCommand::OpenLink(idx) => self.open_link(idx),
             UiCommand::SubmitForm(idx, value) => self.submit_form(idx, &value),
             UiCommand::OpenMedia(idx) => self.open_media(idx),
@@ -360,6 +375,7 @@ impl Browser {
             });
             let images = build_image_items(&current.document);
             let media = build_media_items(&current.document);
+            let live_controls = build_live_control_items(&current.document);
             let selected_image_index = self
                 .selected_image_index
                 .and_then(|i| if i < images.len() { Some(i) } else { None });
@@ -384,14 +400,17 @@ impl Browser {
                 },
                 links,
                 auth,
+                live_controls,
                 images,
                 media,
                 media_activity: self.ui_media_activity(),
                 can_load_more: self.companion_authenticated
                     && self.web_mode == SessionWebMode::Companion
+                    && current.can_scroll
                     && !self.companion_feed_capped,
                 loading_more: self.inflight_companion_scroll.is_some()
                     || self.inflight_companion_action.is_some(),
+                updating_live_controls: self.inflight_live_control_action.is_some(),
                 selected_image_index,
                 selected_image_bytes,
                 selected_image_size,
@@ -422,11 +441,13 @@ impl Browser {
                 },
                 links: vec![],
                 auth: None,
+                live_controls: vec![],
                 images: vec![],
                 media: vec![],
                 media_activity: self.ui_media_activity(),
                 can_load_more: false,
                 loading_more: false,
+                updating_live_controls: false,
                 selected_image_index: None,
                 selected_image_bytes: None,
                 selected_image_size: None,
@@ -538,6 +559,7 @@ impl Browser {
         self.inflight_dynamic = None;
         self.inflight_companion_scroll = None;
         self.inflight_companion_action = None;
+        self.inflight_live_control_action = None;
         self.companion_feed_capped = false;
         self.web_mode = SessionWebMode::Static;
         if is_about_blank(&url) {
@@ -592,6 +614,7 @@ impl Browser {
         self.inflight_dynamic = None;
         self.inflight_companion_scroll = None;
         self.inflight_companion_action = None;
+        self.inflight_live_control_action = None;
         self.companion_feed_capped = false;
         self.inflight_companion_nav = Some(PendingCompanionNavigation { request_id, plan });
         self.clear_selected_image_data();
@@ -609,7 +632,7 @@ impl Browser {
                 "feed memory limit reached; open a link or reload to start a fresh view".into();
             return Ok(());
         }
-        if self.inflight_companion_scroll.is_some() || self.inflight_companion_action.is_some() {
+        if self.live_page_update_inflight() {
             self.last_status = "fetching more feed content".into();
             return Ok(());
         }
@@ -645,21 +668,187 @@ impl Browser {
             self.companion_authenticated && self.web_mode == SessionWebMode::Companion,
             "continuation controls require a connected secure browser session"
         );
-        if self.inflight_companion_action.is_some() || self.inflight_companion_scroll.is_some() {
+        if self.live_page_update_inflight() {
             self.last_status = "a live page update is already in progress".to_string();
             return Ok(());
         }
         let request_id = self.next_request_id();
+        let expected_url = self
+            .current
+            .as_ref()
+            .context("no current page")?
+            .url
+            .clone();
         self.companion
             .as_ref()
             .context("secure browser session is unavailable")?
-            .activate(request_id, button.glance_id)?;
+            .activate(
+                request_id,
+                expected_url,
+                button.glance_id,
+                button.label.clone(),
+            )?;
         self.inflight_companion_action = Some(PendingCompanionAction {
             request_id,
             label: button.label.clone(),
         });
         self.last_status = format!("activating {}", button.label);
         Ok(())
+    }
+
+    fn activate_live_control(&mut self, index: usize) -> Result<()> {
+        let control = self
+            .current
+            .as_ref()
+            .and_then(|page| page.document.live_controls.get(index))
+            .cloned()
+            .with_context(|| format!("live control {} is unavailable", index + 1))?;
+        anyhow::ensure!(
+            control.kind != LiveControlKind::Field,
+            "live field must be edited instead of activated"
+        );
+        self.ensure_live_control_session()?;
+        if self.live_page_update_inflight() {
+            self.last_status = "a live page update is already in progress".to_string();
+            return Ok(());
+        }
+        let request_id = self.next_request_id();
+        let expected_url = self
+            .current
+            .as_ref()
+            .context("no current page")?
+            .url
+            .clone();
+        self.companion
+            .as_ref()
+            .context("secure browser session is unavailable")?
+            .activate_live(
+                request_id,
+                expected_url,
+                control.glance_id,
+                control.kind,
+                control.label.clone(),
+            )?;
+        self.inflight_live_control_action = Some(PendingLiveControlAction {
+            request_id,
+            label: control.label.clone(),
+        });
+        self.last_status = format!("updating live control {}", control.label);
+        Ok(())
+    }
+
+    fn fill_live_field(&mut self, index: usize, value: &str) -> Result<()> {
+        let control = self
+            .current
+            .as_ref()
+            .and_then(|page| page.document.live_controls.get(index))
+            .cloned()
+            .with_context(|| format!("live field {} is unavailable", index + 1))?;
+        anyhow::ensure!(
+            control.kind == LiveControlKind::Field,
+            "selected live control is not an editable field"
+        );
+        let field_kind = control
+            .field_kind
+            .context("live field type is unavailable")?;
+        anyhow::ensure!(
+            matches!(
+                field_kind,
+                LiveFieldKind::Text | LiveFieldKind::TextArea | LiveFieldKind::Select
+            ),
+            "selected live field does not accept a text value"
+        );
+        self.ensure_live_control_session()?;
+        if self.live_page_update_inflight() {
+            self.last_status = "a live page update is already in progress".to_string();
+            return Ok(());
+        }
+        let request_id = self.next_request_id();
+        let expected_url = self
+            .current
+            .as_ref()
+            .context("no current page")?
+            .url
+            .clone();
+        self.companion
+            .as_ref()
+            .context("secure browser session is unavailable")?
+            .fill_live(
+                request_id,
+                expected_url,
+                control.glance_id,
+                field_kind,
+                control.label.clone(),
+                value.to_string(),
+            )?;
+        self.inflight_live_control_action = Some(PendingLiveControlAction {
+            request_id,
+            label: control.label.clone(),
+        });
+        self.last_status = format!("editing live field {}", control.label);
+        Ok(())
+    }
+
+    fn toggle_live_field(&mut self, index: usize) -> Result<()> {
+        let control = self
+            .current
+            .as_ref()
+            .and_then(|page| page.document.live_controls.get(index))
+            .cloned()
+            .with_context(|| format!("live field {} is unavailable", index + 1))?;
+        anyhow::ensure!(
+            control.kind == LiveControlKind::Field,
+            "selected live control is not an editable field"
+        );
+        let field_kind = control
+            .field_kind
+            .context("live field type is unavailable")?;
+        anyhow::ensure!(
+            matches!(field_kind, LiveFieldKind::Checkbox | LiveFieldKind::Radio),
+            "selected live field is not a toggle"
+        );
+        self.ensure_live_control_session()?;
+        if self.live_page_update_inflight() {
+            self.last_status = "a live page update is already in progress".to_string();
+            return Ok(());
+        }
+        let request_id = self.next_request_id();
+        let expected_url = self
+            .current
+            .as_ref()
+            .context("no current page")?
+            .url
+            .clone();
+        self.companion
+            .as_ref()
+            .context("secure browser session is unavailable")?
+            .toggle_live(
+                request_id,
+                expected_url,
+                control.glance_id,
+                field_kind,
+                control.label.clone(),
+            )?;
+        self.inflight_live_control_action = Some(PendingLiveControlAction {
+            request_id,
+            label: control.label.clone(),
+        });
+        self.last_status = format!("updating {}", control.label);
+        Ok(())
+    }
+
+    fn ensure_live_control_session(&self) -> Result<()> {
+        anyhow::ensure!(
+            self.companion_authenticated && self.web_mode == SessionWebMode::Companion,
+            "live controls require a connected secure browser session"
+        );
+        Ok(())
+    }
+
+    fn live_page_update_inflight(&self) -> bool {
+        self.inflight_companion_action.is_some()
+            || self.inflight_companion_scroll.is_some()
+            || self.inflight_live_control_action.is_some()
     }
 
     fn open_link(&mut self, idx: usize) -> Result<()> {
@@ -934,6 +1123,7 @@ impl Browser {
                                     url,
                                     rendered: page.rendered,
                                     document: page.document,
+                                    can_scroll: false,
                                 },
                                 "loaded dynamic DOM".to_string(),
                             );
@@ -1081,6 +1271,11 @@ impl Browser {
                     snapshot,
                 } => self.handle_companion_activation(request_id, snapshot),
                 CompanionEvent::Snapshot {
+                    request_id,
+                    operation: CompanionOperation::ActivateLive | CompanionOperation::FillLive,
+                    snapshot,
+                } => self.handle_live_control_update(request_id, snapshot),
+                CompanionEvent::Snapshot {
                     operation: CompanionOperation::Authenticate | CompanionOperation::Focus,
                     ..
                 } => {}
@@ -1143,6 +1338,16 @@ impl Browser {
                             self.last_status = format!("continuation control failed: {error}");
                         }
                     }
+                    CompanionOperation::ActivateLive | CompanionOperation::FillLive => {
+                        if self
+                            .inflight_live_control_action
+                            .as_ref()
+                            .is_some_and(|pending| pending.request_id == request_id)
+                        {
+                            self.inflight_live_control_action = None;
+                            self.last_status = format!("live control update failed: {error}");
+                        }
+                    }
                 },
             }
         }
@@ -1187,6 +1392,7 @@ impl Browser {
         let Some(current) = &mut self.current else {
             return;
         };
+        current.can_scroll = loaded.can_scroll;
         let merge = merge_feed_document(&mut current.document, loaded.document);
         current.url = loaded.url;
         current.rendered = render_document(&current.document, self.render_icon_mode);
@@ -1253,6 +1459,7 @@ impl Browser {
         let Some(current) = &mut self.current else {
             return;
         };
+        current.can_scroll = loaded.can_scroll;
         let merge = merge_feed_document(&mut current.document, loaded.document);
         current.url = loaded.url;
         current.rendered = render_document(&current.document, self.render_icon_mode);
@@ -1264,6 +1471,47 @@ impl Browser {
         } else {
             format!("{label} activated; waiting for readable content")
         };
+    }
+
+    fn handle_live_control_update(&mut self, request_id: u64, snapshot: CompanionSnapshot) {
+        let Some(pending) = self.inflight_live_control_action.as_ref() else {
+            return;
+        };
+        if pending.request_id != request_id {
+            return;
+        }
+        let label = self
+            .inflight_live_control_action
+            .take()
+            .map(|pending| pending.label)
+            .unwrap_or_else(|| "live control".to_string());
+        let loaded = match loaded_from_companion(
+            snapshot,
+            self.render_icon_mode,
+            self.network_policy.sanitize_control_chars,
+        ) {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                self.last_status = format!("live control render error: {error:#}");
+                return;
+            }
+        };
+        if let Err(error) = self.validate_url_for_network(&loaded.url) {
+            self.last_status = format!("live control left the network boundary: {error:#}");
+            return;
+        }
+
+        let same_page = self.current.as_ref().is_some_and(|current| {
+            same_origin(&current.url, &loaded.url) && current.url.path() == loaded.url.path()
+        });
+        if !same_page {
+            self.apply_history_plan(HistoryPlan::SetCursor(self.cursor), loaded.url.clone());
+            self.companion_feed_capped = false;
+            self.apply_loaded_page(loaded, format!("{label} opened a new live page"));
+            return;
+        }
+
+        self.apply_loaded_page(loaded, format!("{label} · live interface updated"));
     }
 
     fn handle_auth_observation(&mut self, request_id: u64, snapshot: CompanionSnapshot) {
@@ -1592,6 +1840,9 @@ impl Browser {
         if self.inflight_companion_action.is_some() {
             parts.push("ACTION".to_string());
         }
+        if self.inflight_live_control_action.is_some() {
+            parts.push("CONTROL".to_string());
+        }
         if self.pending_auth.is_some() {
             parts.push("AUTH".to_string());
         }
@@ -1679,6 +1930,7 @@ fn loaded_from_companion(
         url: snapshot.url,
         rendered,
         document,
+        can_scroll: snapshot.can_scroll,
     })
 }
 
@@ -1696,6 +1948,7 @@ fn merge_feed_document(current: &mut Document, incoming: Document) -> FeedMerge 
         links,
         forms,
         continuation_buttons,
+        live_controls,
         images,
         media_links,
         script_count,
@@ -1710,6 +1963,7 @@ fn merge_feed_document(current: &mut Document, incoming: Document) -> FeedMerge 
     current.script_count = current.script_count.max(script_count);
     current.meta_http_equiv = meta_http_equiv;
     current.continuation_buttons = continuation_buttons;
+    current.live_controls = live_controls;
 
     let (new_lines, lines_capped) =
         append_unique_debug(&mut current.text_lines, text_lines, MAX_FEED_TEXT_LINES);
@@ -1845,6 +2099,44 @@ fn build_link_items(doc: &Document) -> Vec<UiResourceItem> {
                 .as_ref()
                 .map(ToString::to_string)
                 .unwrap_or_else(|| link.href.clone()),
+        })
+        .collect()
+}
+
+fn build_live_control_items(doc: &Document) -> Vec<UiLiveControlItem> {
+    doc.live_controls
+        .iter()
+        .map(|control| UiLiveControlItem {
+            label: control.label.clone(),
+            context: control.context.clone(),
+            value: control.value.clone(),
+            placeholder: control.placeholder.clone(),
+            kind: match control.kind {
+                LiveControlKind::Disclosure => UiLiveControlKind::Disclosure,
+                LiveControlKind::Action => UiLiveControlKind::Action,
+                LiveControlKind::Submit => UiLiveControlKind::Submit,
+                LiveControlKind::Field => UiLiveControlKind::Field,
+            },
+            field_kind: control.field_kind.map(|kind| match kind {
+                LiveFieldKind::Text => UiLiveFieldKind::Text,
+                LiveFieldKind::TextArea => UiLiveFieldKind::TextArea,
+                LiveFieldKind::Checkbox => UiLiveFieldKind::Checkbox,
+                LiveFieldKind::Radio => UiLiveFieldKind::Radio,
+                LiveFieldKind::Select => UiLiveFieldKind::Select,
+            }),
+            checked: control.checked,
+            options: control
+                .options
+                .iter()
+                .map(|option| UiLiveOption {
+                    label: option.label.clone(),
+                    value: option.value.clone(),
+                    selected: option.selected,
+                    disabled: option.disabled,
+                })
+                .collect(),
+            requires_confirmation: control.kind.requires_confirmation(),
+            multiline: control.multiline,
         })
         .collect()
 }
@@ -1998,6 +2290,7 @@ async fn fetch_and_build_async(
             );
             // Server HTML cannot opt itself into companion-only button execution.
             document.continuation_buttons.clear();
+            document.live_controls.clear();
             let suggest_dynamic = looks_like_client_rendered_shell(&document, &fetch.body);
             if let Some(refresh) = document.meta_http_equiv.refresh.as_ref()
                 && refresh.delay_secs == 0
@@ -2016,6 +2309,7 @@ async fn fetch_and_build_async(
                 url: fetch.final_url.clone(),
                 rendered,
                 document,
+                can_scroll: false,
             };
 
             return Ok(NavigationOutcome {
@@ -2031,6 +2325,7 @@ async fn fetch_and_build_async(
             url: fetch.final_url.clone(),
             rendered,
             document,
+            can_scroll: false,
         };
         return Ok(NavigationOutcome {
             loaded,
@@ -2096,6 +2391,7 @@ fn empty_document(url: Url, title: &str) -> Document {
         links: vec![],
         forms: vec![],
         continuation_buttons: vec![],
+        live_controls: vec![],
         images: vec![],
         media_links: vec![],
         script_count: 0,
@@ -2121,6 +2417,7 @@ fn blank_loaded_page(url: Url) -> LoadedPage {
             interactive_spans: vec![],
         },
         document: empty_document(url, "Blank Page"),
+        can_scroll: false,
     }
 }
 
@@ -2313,6 +2610,7 @@ mod tests {
             url: signed_in_url,
             rendered: render_document(&document, RenderIconMode::Ascii),
             document,
+            can_scroll: false,
         };
         assert!(auth_session_completed(&loaded, &auth_url, &return_url));
 
@@ -2322,6 +2620,7 @@ mod tests {
             url: attacker_url,
             rendered: render_document(&document, RenderIconMode::Ascii),
             document,
+            can_scroll: false,
         };
         assert!(!auth_session_completed(&loaded, &auth_url, &return_url));
     }
@@ -2361,6 +2660,7 @@ mod tests {
             url: auth_url.clone(),
             rendered: render_document(&document, RenderIconMode::Ascii),
             document,
+            can_scroll: false,
         };
         assert!(!auth_session_completed(&loaded, &auth_url, &return_url));
     }
@@ -2416,6 +2716,7 @@ mod tests {
             url,
             rendered,
             document,
+            can_scroll: false,
         });
 
         let started = Instant::now();

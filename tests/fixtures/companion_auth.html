@@ -11,7 +11,11 @@
     </main>
     <script>
       localStorage.setItem('glance-fixture-authenticated', 'yes');
-      setTimeout(() => location.replace('companion_feed.html'), 300);
+      const requestedTarget = new URLSearchParams(location.search).get('target');
+      const target = ['companion_feed.html', 'companion_controls.html'].includes(requestedTarget)
+        ? requestedTarget
+        : 'companion_feed.html';
+      setTimeout(() => location.replace(target), 300);
     </script>
   </body>
 </html>

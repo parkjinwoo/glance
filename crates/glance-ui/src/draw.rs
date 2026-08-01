@@ -14,7 +14,7 @@ use crate::app_state::{AddressMode, App, FocusPane, SidebarAction, UiLayout};
 use crate::navigation::{
     build_visual_line_map, cursor_logical_line_from_visual, cursor_target_from_visual,
 };
-use crate::{UiImageMode, UiPage, UiWebMode};
+use crate::{UiImageMode, UiLiveFieldKind, UiPage, UiWebMode};
 
 const SURFACE: Color = Color::Rgb(14, 18, 25);
 const SURFACE_RAISED: Color = Color::Rgb(20, 25, 34);
@@ -88,14 +88,21 @@ pub(crate) fn draw_ui(frame: &mut Frame, app: &App) {
     draw_footer(frame, app, layout.footer, cursor_action, max_row);
     draw_update_activity(frame, app, layout.content);
 
-    if app.help_open {
+    if app.control_confirmation.is_some() {
+        draw_control_confirmation(frame, app, screen);
+    } else if app.live_choice_editor.is_some() {
+        draw_live_choice_editor(frame, app, screen);
+    } else if matches!(app.address_mode, AddressMode::LiveField(_)) {
+        draw_live_text_editor(frame, app, screen);
+    } else if app.help_open {
         draw_help_overlay(frame, screen);
     } else if app.media_picker_open {
         draw_media_picker(frame, app, screen);
     } else if app.image_viewer_open {
         draw_image_viewer_shell(frame, app, screen);
     }
-    if !app.help_open
+    if app.control_confirmation.is_none()
+        && !app.help_open
         && app
             .page
             .media_activity
@@ -107,7 +114,12 @@ pub(crate) fn draw_ui(frame: &mut Frame, app: &App) {
 }
 
 fn draw_update_activity(frame: &mut Frame, app: &App, content: Rect) {
-    let running = if app.page.loading_more {
+    let running = if app.page.updating_live_controls {
+        Some((
+            format!("{}  Updating live controls", spinner(app.animation_tick)),
+            Color::Yellow,
+        ))
+    } else if app.page.loading_more {
         Some((
             format!("{}  Loading live content", spinner(app.animation_tick)),
             Color::Cyan,
@@ -134,29 +146,48 @@ fn draw_update_activity(frame: &mut Frame, app: &App, content: Rect) {
             },
         )
     });
+    let is_running = running.is_some();
     let Some((message, color)) = running.or(completed) else {
         return;
     };
-    if content.width < 28 || content.height < 5 {
+    if content.width < 28 || content.height < 7 {
         return;
     }
-    let width = (UnicodeWidthStr::width(message.as_str()) as u16 + 4)
+    let width = (UnicodeWidthStr::width(message.as_str()) as u16 + 6)
         .min(content.width.saturating_sub(2))
-        .max(24);
+        .max(28);
     let area = Rect::new(
         content.right().saturating_sub(width).saturating_sub(1),
         content.y.saturating_add(1),
         width,
-        3,
+        5,
     );
     frame.render_widget(Clear, area);
     frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            message,
-            Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
-        )))
+        Paragraph::new(vec![
+            Line::from(Span::styled(
+                message,
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::styled(
+                if is_running {
+                    "━━━━━━━╺━━━━━━━━"
+                } else {
+                    "━━━━━━━━━━━━━━━━"
+                },
+                Style::default().fg(color),
+            )),
+            Line::from(Span::styled(
+                if is_running {
+                    "Interface remains responsive"
+                } else {
+                    "Ready"
+                },
+                Style::default().fg(Color::DarkGray),
+            )),
+        ])
         .style(Style::default().bg(SURFACE_RAISED))
         .block(
             Block::default()
@@ -222,7 +253,7 @@ fn draw_address_bar(frame: &mut Frame, app: &App, area: Rect) {
         AddressMode::Nav => Color::Blue,
         AddressMode::Edit => Color::Cyan,
         AddressMode::Find => Color::Yellow,
-        AddressMode::Form(_) => Color::Magenta,
+        AddressMode::Form(_) | AddressMode::LiveField(_) => Color::Magenta,
     };
     let active = app.focus == FocusPane::Address || app.address_mode != AddressMode::Nav;
     let line = if app.address_mode != AddressMode::Nav {
@@ -231,6 +262,7 @@ fn draw_address_bar(frame: &mut Frame, app: &App, area: Rect) {
             AddressMode::Edit => "› ",
             AddressMode::Find => "/ ",
             AddressMode::Form(_) => "? ",
+            AddressMode::LiveField(_) => "✎ ",
             AddressMode::Nav => "",
         };
         Line::from(vec![
@@ -884,6 +916,414 @@ fn draw_help_overlay(frame: &mut Frame, screen: Rect) {
     );
 }
 
+pub(crate) fn live_text_editor_rect(area: Rect, multiline: bool) -> Rect {
+    let width = (area.width.saturating_mul(82) / 100)
+        .clamp(38, 88)
+        .min(area.width);
+    let desired_height = if multiline { 16 } else { 10 };
+    let height = desired_height.min(area.height).max(8.min(area.height));
+    Rect::new(
+        area.x
+            .saturating_add(area.width.saturating_sub(width).saturating_div(2)),
+        area.y
+            .saturating_add(area.height.saturating_sub(height).saturating_div(2)),
+        width,
+        height,
+    )
+}
+
+pub(crate) fn live_text_editor_buttons(area: Rect, multiline: bool) -> (Rect, Rect) {
+    let editor = live_text_editor_rect(area, multiline);
+    let width = 19_u16.min(editor.width.saturating_sub(6).saturating_div(2));
+    let row = editor.bottom().saturating_sub(3);
+    (
+        Rect::new(editor.x.saturating_add(3), row, width, 1),
+        Rect::new(
+            editor.right().saturating_sub(width).saturating_sub(3),
+            row,
+            width,
+            1,
+        ),
+    )
+}
+
+fn draw_live_text_editor(frame: &mut Frame, app: &App, screen: Rect) {
+    let AddressMode::LiveField(index) = app.address_mode else {
+        return;
+    };
+    let Some(control) = app.page.live_controls.get(index) else {
+        return;
+    };
+    let multiline = control.field_kind == Some(UiLiveFieldKind::TextArea);
+    let area = live_text_editor_rect(screen, multiline);
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Block::default()
+            .style(Style::default().bg(SURFACE_RAISED))
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(Color::Magenta))
+            .title(Span::styled(
+                format!(" ✎  {} ", control.label),
+                Style::default()
+                    .fg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD),
+            )),
+        area,
+    );
+    let input_area = Rect::new(
+        area.x.saturating_add(3),
+        area.y.saturating_add(2),
+        area.width.saturating_sub(6),
+        area.height.saturating_sub(7),
+    );
+    frame.render_widget(
+        Block::default()
+            .style(Style::default().bg(SURFACE))
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(Color::Rgb(74, 52, 90))),
+        input_area,
+    );
+    let body = input_area.inner(Margin {
+        vertical: 1,
+        horizontal: 2,
+    });
+    let content = if app.command.is_empty() {
+        vec![Line::from(vec![
+            Span::styled("▏", Style::default().fg(Color::Magenta)),
+            Span::styled(
+                control.placeholder.clone().unwrap_or_default(),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ])]
+    } else {
+        live_editor_lines(&app.command, app.command_cursor)
+    };
+    let editor_scroll = live_editor_scroll(
+        &app.command,
+        app.command_cursor,
+        body.width as usize,
+        body.height as usize,
+    );
+    frame.render_widget(
+        Paragraph::new(content)
+            .style(Style::default().bg(SURFACE))
+            .scroll((editor_scroll, 0))
+            .wrap(Wrap { trim: false }),
+        body,
+    );
+    let hint = if multiline {
+        "Enter newline  ·  Ctrl-Enter apply"
+    } else {
+        "Enter apply"
+    };
+    frame.render_widget(
+        Paragraph::new(Span::styled(hint, Style::default().fg(Color::DarkGray))),
+        Rect::new(
+            area.x.saturating_add(3),
+            area.bottom().saturating_sub(5),
+            area.width.saturating_sub(6),
+            1,
+        ),
+    );
+    let (cancel, apply) = live_text_editor_buttons(screen, multiline);
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            "  Cancel  Esc ",
+            Style::default().fg(Color::White).bg(Color::DarkGray),
+        )),
+        cancel,
+    );
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            if multiline {
+                " Apply  Ctrl-Enter "
+            } else {
+                "  Apply  Enter  "
+            },
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
+        )),
+        apply,
+    );
+}
+
+fn live_editor_lines(value: &str, cursor: usize) -> Vec<Line<'static>> {
+    let (before, _) = split_at_char(value, cursor);
+    let cursor_line = before.split('\n').count().saturating_sub(1);
+    let cursor_column = before
+        .rsplit('\n')
+        .next()
+        .map(|line| line.chars().count())
+        .unwrap_or(0);
+    value
+        .split('\n')
+        .enumerate()
+        .map(|(line_index, line)| {
+            if line_index != cursor_line {
+                return Line::from(Span::styled(
+                    line.to_string(),
+                    Style::default().fg(Color::White),
+                ));
+            }
+            let (left, right) = split_at_char(line, cursor_column);
+            Line::from(vec![
+                Span::styled(left, Style::default().fg(Color::White)),
+                Span::styled(
+                    "▏",
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Magenta)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(right, Style::default().fg(Color::White)),
+            ])
+        })
+        .collect()
+}
+
+pub(crate) fn live_editor_scroll(value: &str, cursor: usize, width: usize, height: usize) -> u16 {
+    if width == 0 || height == 0 {
+        return 0;
+    }
+    let (before, _) = split_at_char(value, cursor);
+    let mut cursor_row = 0_usize;
+    let mut lines = before.split('\n').peekable();
+    while let Some(line) = lines.next() {
+        let line_width = UnicodeWidthStr::width(line);
+        if lines.peek().is_some() {
+            cursor_row = cursor_row.saturating_add(line_width.max(1).div_ceil(width));
+        } else {
+            cursor_row = cursor_row.saturating_add(line_width / width);
+        }
+    }
+    cursor_row
+        .saturating_sub(height.saturating_sub(1))
+        .min(u16::MAX as usize) as u16
+}
+
+pub(crate) fn live_choice_rect(area: Rect) -> Rect {
+    let width = (area.width.saturating_mul(64) / 100)
+        .clamp(34, 68)
+        .min(area.width);
+    let height = (area.height.saturating_mul(70) / 100)
+        .clamp(10, 20)
+        .min(area.height);
+    Rect::new(
+        area.x
+            .saturating_add(area.width.saturating_sub(width).saturating_div(2)),
+        area.y
+            .saturating_add(area.height.saturating_sub(height).saturating_div(2)),
+        width,
+        height,
+    )
+}
+
+pub(crate) fn live_choice_options_rect(area: Rect) -> Rect {
+    let editor = live_choice_rect(area);
+    Rect::new(
+        editor.x.saturating_add(2),
+        editor.y.saturating_add(2),
+        editor.width.saturating_sub(4),
+        editor.height.saturating_sub(5),
+    )
+}
+
+pub(crate) fn live_choice_window_start(selected: usize, len: usize, visible_rows: usize) -> usize {
+    if visible_rows == 0 || len <= visible_rows {
+        return 0;
+    }
+    selected
+        .saturating_sub(visible_rows.saturating_sub(1) / 2)
+        .min(len.saturating_sub(visible_rows))
+}
+
+fn draw_live_choice_editor(frame: &mut Frame, app: &App, screen: Rect) {
+    let Some(editor) = &app.live_choice_editor else {
+        return;
+    };
+    let Some(control) = app.page.live_controls.get(editor.control_index) else {
+        return;
+    };
+    let area = live_choice_rect(screen);
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Block::default()
+            .style(Style::default().bg(SURFACE_RAISED))
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(Color::Cyan))
+            .title(Span::styled(
+                format!(" ▾  {} ", control.label),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )),
+        area,
+    );
+    let options_area = live_choice_options_rect(screen);
+    let visible_rows = options_area.height as usize;
+    let window_start =
+        live_choice_window_start(editor.selected_index, control.options.len(), visible_rows);
+    let options = control
+        .options
+        .iter()
+        .enumerate()
+        .skip(window_start)
+        .take(visible_rows)
+        .map(|(index, option)| {
+            let selected = index == editor.selected_index;
+            let marker = if option.selected { "●" } else { "○" };
+            let style = if option.disabled {
+                Style::default().fg(Color::DarkGray)
+            } else if selected {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            ListItem::new(Line::from(Span::styled(
+                format!(" {marker}  {}", option.label),
+                style,
+            )))
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(List::new(options), options_area);
+    let position = if control.options.is_empty() {
+        "0/0".to_string()
+    } else {
+        format!(
+            "{}/{}",
+            editor.selected_index.saturating_add(1),
+            control.options.len()
+        )
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(" ↑↓ ", Style::default().fg(Color::Black).bg(Color::Cyan)),
+            Span::styled(" choose   ", Style::default().fg(Color::Gray)),
+            Span::styled(" Enter ", Style::default().fg(Color::Black).bg(Color::Cyan)),
+            Span::styled(
+                format!(" apply   Esc cancel   {position}"),
+                Style::default().fg(Color::Gray),
+            ),
+        ])),
+        Rect::new(
+            area.x.saturating_add(2),
+            area.bottom().saturating_sub(2),
+            area.width.saturating_sub(4),
+            1,
+        ),
+    );
+}
+
+pub(crate) fn control_confirmation_rect(area: Rect) -> Rect {
+    let width = 64_u16.min(area.width.saturating_sub(2)).max(1);
+    let height = 10_u16.min(area.height).max(1);
+    Rect::new(
+        area.x
+            .saturating_add(area.width.saturating_sub(width).saturating_div(2)),
+        area.y
+            .saturating_add(area.height.saturating_sub(height).saturating_div(2)),
+        width,
+        height,
+    )
+}
+
+pub(crate) fn control_confirmation_buttons(area: Rect) -> (Rect, Rect) {
+    let dialog = control_confirmation_rect(area);
+    let button_width = 17_u16.min(dialog.width.saturating_sub(4).saturating_div(2));
+    let row = dialog.bottom().saturating_sub(3);
+    let cancel = Rect::new(dialog.x.saturating_add(3), row, button_width, 1);
+    let confirm = Rect::new(
+        dialog
+            .right()
+            .saturating_sub(button_width)
+            .saturating_sub(3),
+        row,
+        button_width,
+        1,
+    );
+    (cancel, confirm)
+}
+
+fn draw_control_confirmation(frame: &mut Frame, app: &App, screen: Rect) {
+    let Some(confirmation) = &app.control_confirmation else {
+        return;
+    };
+    let area = control_confirmation_rect(screen);
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Block::default()
+            .style(Style::default().bg(SURFACE_RAISED))
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(Color::Yellow))
+            .title(Span::styled(
+                " Confirm live action ",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )),
+        area,
+    );
+    let context = confirmation
+        .context
+        .as_deref()
+        .map(|value| format!("Context  {value}"))
+        .unwrap_or_else(|| format!("Site  {}", page_origin(&app.page.rendered.source_url)));
+    let body = Rect::new(
+        area.x.saturating_add(3),
+        area.y.saturating_add(2),
+        area.width.saturating_sub(6),
+        area.height.saturating_sub(6),
+    );
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(Span::styled(
+                confirmation.label.clone(),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::styled(context, Style::default().fg(Color::Gray))),
+            Line::from(""),
+            Line::from(Span::styled(
+                "This may publish content or change your account state.",
+                Style::default().fg(Color::Yellow),
+            )),
+        ])
+        .wrap(Wrap { trim: true }),
+        body,
+    );
+    let (cancel, confirm) = control_confirmation_buttons(screen);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "  Cancel  Esc ",
+            Style::default()
+                .fg(Color::White)
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        ))),
+        cancel,
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            " Confirm  Enter ",
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ))),
+        confirm,
+    );
+}
+
 fn draw_media_picker(frame: &mut Frame, app: &App, screen: Rect) {
     let picker = media_picker_rect(screen);
     let layout = media_picker_layout(picker);
@@ -1057,6 +1497,20 @@ pub(crate) fn styled_content_lines(
             continue;
         }
 
+        if trimmed.starts_with("╭─") || trimmed == "╰─" {
+            styled.push(Line::from(Span::styled(
+                line.to_string(),
+                Style::default()
+                    .fg(if trimmed.contains("ACTIVE") {
+                        Color::Magenta
+                    } else {
+                        Color::Cyan
+                    })
+                    .add_modifier(Modifier::BOLD),
+            )));
+            continue;
+        }
+
         if trimmed.starts_with('#') {
             let heading = line.trim_start();
             let indent_len = line.len().saturating_sub(heading.len());
@@ -1107,6 +1561,7 @@ pub(crate) fn styled_content_lines(
                         actions[0],
                         cursor_line == Some(line_idx),
                         hovered_action == Some(actions[0]),
+                        live_action_accent(page, actions[0]),
                     );
                     styled.push(Line::from(vec![
                         Span::styled(token.to_string(), token_style),
@@ -1221,6 +1676,7 @@ pub(crate) fn interactive_styles(
     action: InteractiveAction,
     selected: bool,
     hovered: bool,
+    live_accent: Option<Color>,
 ) -> (Style, Style) {
     let (token_style, label_style) = match action {
         InteractiveAction::OpenLink(_) => (
@@ -1266,6 +1722,24 @@ pub(crate) fn interactive_styles(
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
         ),
+        InteractiveAction::EditLiveField(_) => (
+            Style::default()
+                .fg(Color::Black)
+                .bg(live_accent.unwrap_or(Color::Magenta))
+                .add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(live_accent.unwrap_or(Color::Magenta))
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+        ),
+        InteractiveAction::ActivateLiveControl(_) => (
+            Style::default()
+                .fg(Color::Black)
+                .bg(live_accent.unwrap_or(Color::Yellow))
+                .add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(live_accent.unwrap_or(Color::Yellow))
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+        ),
     };
 
     if selected {
@@ -1283,6 +1757,28 @@ pub(crate) fn interactive_styles(
     } else {
         (token_style, label_style)
     }
+}
+
+fn live_action_accent(page: &UiPage, action: InteractiveAction) -> Option<Color> {
+    let (index, field) = match action {
+        InteractiveAction::EditLiveField(index) => (index, true),
+        InteractiveAction::ActivateLiveControl(index) => (index, false),
+        _ => return None,
+    };
+    let control = page.live_controls.get(index)?;
+    if field {
+        return Some(match control.field_kind {
+            Some(UiLiveFieldKind::Checkbox | UiLiveFieldKind::Radio) => Color::Green,
+            Some(UiLiveFieldKind::Select) => Color::Cyan,
+            _ => Color::Magenta,
+        });
+    }
+    Some(match control.kind {
+        crate::UiLiveControlKind::Disclosure => Color::Cyan,
+        crate::UiLiveControlKind::Submit => Color::Green,
+        crate::UiLiveControlKind::Action => Color::Yellow,
+        crate::UiLiveControlKind::Field => Color::Magenta,
+    })
 }
 
 fn split_numbered_marker(input: &str) -> Option<(&str, &str)> {

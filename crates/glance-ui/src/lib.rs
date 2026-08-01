@@ -29,8 +29,9 @@ use input::{
     request_media_launch,
 };
 pub use model::{
-    UiAuthItem, UiCommand, UiIconMode, UiImageMode, UiMediaActivity, UiMediaItem, UiMediaKind,
-    UiMediaPhase, UiPage, UiResourceItem, UiWebMode,
+    UiAuthItem, UiCommand, UiIconMode, UiImageMode, UiLiveControlItem, UiLiveControlKind,
+    UiLiveFieldKind, UiLiveOption, UiMediaActivity, UiMediaItem, UiMediaKind, UiMediaPhase, UiPage,
+    UiResourceItem, UiWebMode,
 };
 use navigation::{
     clamp_content_scroll_to_terminal, clamp_cursor_to_terminal, sync_scroll_to_cursor,
@@ -77,6 +78,8 @@ where
                     flush_scroll_accumulator(app, &mut scroll_acc)?;
                     feed_advance_intent |= app.address_mode == AddressMode::Nav
                         && !app.help_open
+                        && app.live_choice_editor.is_none()
+                        && app.control_confirmation.is_none()
                         && !app.media_picker_open
                         && !app.image_viewer_open
                         && matches!(
@@ -276,6 +279,48 @@ where
             app.set_click_feedback("requesting more content");
             apply_command(app, UiCommand::ActivateButton(idx), on_command)?;
         }
+        InteractiveAction::EditLiveField(idx) => {
+            if app.page.updating_live_controls || app.page.loading_more {
+                app.set_click_feedback("live interface update in progress");
+                return Ok(());
+            }
+            let Some(control) = app.page.live_controls.get(idx).cloned() else {
+                app.set_click_feedback("live field unavailable");
+                return Ok(());
+            };
+            match control.field_kind {
+                Some(UiLiveFieldKind::Text | UiLiveFieldKind::TextArea) => {
+                    app.enter_live_field_edit(idx, control.value.clone());
+                    app.set_click_feedback(format!("edit {}", control.label));
+                }
+                Some(UiLiveFieldKind::Checkbox | UiLiveFieldKind::Radio) => {
+                    app.set_click_feedback(format!("update {}", control.label));
+                    apply_command(app, UiCommand::ToggleLiveField(idx), on_command)?;
+                }
+                Some(UiLiveFieldKind::Select) => {
+                    app.open_live_choice_editor(idx);
+                    app.set_click_feedback(format!("choose {}", control.label));
+                }
+                None => app.set_click_feedback("unsupported live field"),
+            }
+        }
+        InteractiveAction::ActivateLiveControl(idx) => {
+            if app.page.updating_live_controls || app.page.loading_more {
+                app.set_click_feedback("live interface update in progress");
+                return Ok(());
+            }
+            let Some(control) = app.page.live_controls.get(idx).cloned() else {
+                app.set_click_feedback("live control unavailable");
+                return Ok(());
+            };
+            if control.requires_confirmation {
+                app.request_control_confirmation(idx, control.label, control.context);
+                app.set_click_feedback("confirmation required");
+            } else {
+                app.set_click_feedback(format!("opening {}", control.label));
+                apply_command(app, UiCommand::ActivateLiveControl(idx), on_command)?;
+            }
+        }
     }
     Ok(())
 }
@@ -292,6 +337,7 @@ where
     let prev_entry_id = app.page.history_entry_id;
     let prev_web_mode = app.page.web_mode;
     let prev_loading_more = app.page.loading_more;
+    let prev_updating_live_controls = app.page.updating_live_controls;
     if should_snapshot_view_state(&command) && prev_entry_id != 0 {
         app.view_state_by_entry.insert(
             prev_entry_id,
@@ -310,6 +356,15 @@ where
                 "Live content update failed"
             } else {
                 "Live content updated"
+            },
+            update_failed,
+        );
+    } else if prev_updating_live_controls && !app.page.updating_live_controls {
+        app.set_update_notice(
+            if update_failed {
+                "Live control update failed"
+            } else {
+                "Live controls updated"
             },
             update_failed,
         );
@@ -385,6 +440,8 @@ fn should_snapshot_view_state(command: &UiCommand) -> bool {
             | UiCommand::Back
             | UiCommand::Forward
             | UiCommand::SubmitForm(_, _)
+            | UiCommand::FillLiveField(_, _)
+            | UiCommand::ToggleLiveField(_)
     )
 }
 
@@ -405,6 +462,8 @@ fn action_label(action: InteractiveAction) -> String {
         InteractiveAction::OpenMedia(i) => format!("M{}", i + 1),
         InteractiveAction::OpenForm(i) => format!("F{}", i + 1),
         InteractiveAction::ActivateButton(i) => format!("B{}", i + 1),
+        InteractiveAction::EditLiveField(i) => format!("E{}", i + 1),
+        InteractiveAction::ActivateLiveControl(i) => format!("A{}", i + 1),
     }
 }
 
@@ -412,20 +471,21 @@ fn action_label(action: InteractiveAction) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        App, UiAuthItem, UiIconMode, UiImageMode, UiMediaActivity, UiMediaItem, UiMediaKind,
-        UiMediaPhase, UiPage, UiResourceItem, UiWebMode, is_near_feed_edge,
+        App, UiAuthItem, UiCommand, UiIconMode, UiImageMode, UiLiveControlItem, UiLiveControlKind,
+        UiLiveFieldKind, UiLiveOption, UiMediaActivity, UiMediaItem, UiMediaKind, UiMediaPhase,
+        UiPage, UiResourceItem, UiWebMode, execute_action, is_near_feed_edge,
     };
     use crate::app_state::{AddressMode, FocusPane};
     use crate::draw::{
-        compute_layout, draw_ui, image_dock_preview_rect, media_picker_layout, media_window_start,
-        reading_progress,
+        compute_layout, draw_ui, image_dock_preview_rect, live_choice_window_start,
+        live_editor_scroll, media_picker_layout, media_window_start, reading_progress,
     };
-    use crate::input::{footer_hitboxes, request_media_launch};
+    use crate::input::{footer_hitboxes, handle_paste, request_media_launch};
     use crate::navigation::{
         clamp_content_scroll, max_content_scroll, wrap_line_map_word_boundary,
     };
     use glance_media::ImageBackend;
-    use glance_render::RenderedPage;
+    use glance_render::{InteractiveAction, RenderedPage};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::layout::Rect;
@@ -491,11 +551,161 @@ mod tests {
     }
 
     #[test]
+    fn confirmable_live_action_opens_a_modal_before_dispatch() {
+        let mut app = test_app(vec!["[A1] Share".to_string()]);
+        app.page.live_controls.push(UiLiveControlItem {
+            label: "Share".to_string(),
+            context: Some("Post".to_string()),
+            value: String::new(),
+            placeholder: None,
+            kind: UiLiveControlKind::Action,
+            field_kind: None,
+            checked: false,
+            options: vec![],
+            requires_confirmation: true,
+            multiline: false,
+        });
+        let mut dispatched = false;
+        execute_action(
+            &mut app,
+            InteractiveAction::ActivateLiveControl(0),
+            &mut |_| {
+                dispatched = true;
+                unreachable!("confirmation must precede dispatch")
+            },
+        )
+        .expect("request confirmation");
+
+        assert!(!dispatched);
+        let confirmation = app.control_confirmation.as_ref().expect("confirmation");
+        assert_eq!(confirmation.label, "Share");
+
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| draw_ui(frame, &app))
+            .expect("draw confirmation");
+        let text = terminal_text(&terminal);
+        assert!(text.contains("Confirm live action"));
+        assert!(text.contains("Share"));
+        assert!(text.contains("Confirm  Enter"));
+    }
+
+    #[test]
+    fn structured_live_fields_open_native_tui_editors() {
+        let mut app = test_app(vec!["form".to_string()]);
+        app.page.live_controls.push(UiLiveControlItem {
+            label: "내용".to_string(),
+            context: Some("댓글".to_string()),
+            value: String::new(),
+            placeholder: Some("Write a reply…".to_string()),
+            kind: UiLiveControlKind::Field,
+            field_kind: Some(UiLiveFieldKind::TextArea),
+            checked: false,
+            options: vec![],
+            requires_confirmation: false,
+            multiline: true,
+        });
+        execute_action(&mut app, InteractiveAction::EditLiveField(0), &mut |_| {
+            unreachable!("text editing is local until apply")
+        })
+        .expect("open editor");
+        assert_eq!(app.address_mode, AddressMode::LiveField(0));
+
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| draw_ui(frame, &app))
+            .expect("draw text editor");
+        let text = terminal_text(&terminal);
+        assert!(text.contains("Write a reply"));
+        assert!(text.contains("Ctrl-Enter apply"));
+    }
+
+    #[test]
+    fn select_uses_a_choice_panel_and_checkbox_toggles_immediately() {
+        let mut app = test_app(vec!["form".to_string()]);
+        app.page.live_controls.push(UiLiveControlItem {
+            label: "언어".to_string(),
+            context: Some("댓글".to_string()),
+            value: "ko".to_string(),
+            placeholder: None,
+            kind: UiLiveControlKind::Field,
+            field_kind: Some(UiLiveFieldKind::Select),
+            checked: false,
+            options: vec![
+                UiLiveOption {
+                    label: "한국어".to_string(),
+                    value: "ko".to_string(),
+                    selected: true,
+                    disabled: false,
+                },
+                UiLiveOption {
+                    label: "English".to_string(),
+                    value: "en".to_string(),
+                    selected: false,
+                    disabled: false,
+                },
+            ],
+            requires_confirmation: false,
+            multiline: false,
+        });
+        execute_action(&mut app, InteractiveAction::EditLiveField(0), &mut |_| {
+            unreachable!("select waits for a choice")
+        })
+        .expect("open choices");
+        assert!(app.live_choice_editor.is_some());
+
+        app.close_live_choice_editor();
+        app.page.live_controls[0].field_kind = Some(UiLiveFieldKind::Checkbox);
+        app.page.live_controls[0].label = "알림".to_string();
+        app.page.live_controls[0].options.clear();
+        let response = app.page.clone();
+        let mut toggled = false;
+        execute_action(
+            &mut app,
+            InteractiveAction::EditLiveField(0),
+            &mut |command| {
+                toggled = matches!(command, UiCommand::ToggleLiveField(0));
+                Ok(response.clone())
+            },
+        )
+        .expect("toggle checkbox");
+        assert!(toggled);
+    }
+
+    #[test]
     fn media_picker_window_keeps_selection_visible() {
         assert_eq!(media_window_start(0, 20, 5), 0);
         assert_eq!(media_window_start(10, 20, 5), 8);
         assert_eq!(media_window_start(19, 20, 5), 15);
         assert_eq!(media_window_start(3, 4, 5), 0);
+    }
+
+    #[test]
+    fn live_choice_window_keeps_large_selects_centered_and_bounded() {
+        assert_eq!(live_choice_window_start(0, 40, 10), 0);
+        assert_eq!(live_choice_window_start(20, 40, 10), 16);
+        assert_eq!(live_choice_window_start(39, 40, 10), 30);
+        assert_eq!(live_choice_window_start(3, 5, 10), 0);
+    }
+
+    #[test]
+    fn live_editor_scroll_keeps_the_cursor_inside_the_field() {
+        let value = "first\nsecond\nthird\nfourth\nfifth";
+        assert_eq!(live_editor_scroll(value, value.chars().count(), 20, 3), 2);
+        assert_eq!(live_editor_scroll("abcdefghij", 10, 4, 2), 1);
+        assert_eq!(live_editor_scroll(value, 0, 20, 3), 0);
+    }
+
+    #[test]
+    fn live_editor_bounds_large_pastes_without_splitting_unicode() {
+        let mut app = test_app(Vec::new());
+        app.address_mode = AddressMode::LiveField(0);
+        handle_paste(&mut app, &"한".repeat(30_000));
+        assert!(app.command.len() <= 64 * 1024);
+        assert!(app.command.is_char_boundary(app.command.len()));
+        assert!(app.effective_status().contains("64 KiB"));
     }
 
     #[test]
@@ -700,11 +910,13 @@ mod tests {
                 image_mode: UiImageMode::Auto,
                 links: Vec::<UiResourceItem>::new(),
                 auth: None,
+                live_controls: Vec::new(),
                 images: Vec::<UiResourceItem>::new(),
                 media: Vec::new(),
                 media_activity: None,
                 can_load_more: false,
                 loading_more: false,
+                updating_live_controls: false,
                 selected_image_index: None,
                 selected_image_bytes: None,
                 selected_image_size: None,
@@ -736,6 +948,8 @@ mod tests {
             scrollbar_dragging: false,
             animation_tick: 0,
             update_notice: None,
+            control_confirmation: None,
+            live_choice_editor: None,
         }
     }
 }

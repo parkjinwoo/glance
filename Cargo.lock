@@ -1144,6 +1144,7 @@ dependencies = [
  "glance-net",
  "glance-render",
  "glance-ui",
+ "serde_json",
  "tempfile",
  "tokio",
  "url",

@@ -20,6 +20,7 @@ pub(crate) enum AddressMode {
     Edit,
     Find,
     Form(usize),
+    LiveField(usize),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -93,6 +94,8 @@ pub(crate) struct App {
     pub(crate) scrollbar_dragging: bool,
     pub(crate) animation_tick: u64,
     pub(crate) update_notice: Option<UpdateNotice>,
+    pub(crate) control_confirmation: Option<ControlConfirmation>,
+    pub(crate) live_choice_editor: Option<LiveChoiceEditor>,
 }
 
 pub(crate) struct ClickFeedback {
@@ -104,6 +107,19 @@ pub(crate) struct UpdateNotice {
     pub(crate) message: String,
     pub(crate) failed: bool,
     pub(crate) ticks_left: u8,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ControlConfirmation {
+    pub(crate) index: usize,
+    pub(crate) label: String,
+    pub(crate) context: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct LiveChoiceEditor {
+    pub(crate) control_index: usize,
+    pub(crate) selected_index: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -150,6 +166,8 @@ impl App {
             scrollbar_dragging: false,
             animation_tick: 0,
             update_notice: None,
+            control_confirmation: None,
+            live_choice_editor: None,
         }
     }
 
@@ -232,6 +250,106 @@ impl App {
         self.command_cursor = 0;
     }
 
+    pub(crate) fn enter_live_field_edit(&mut self, index: usize, value: String) {
+        self.close_live_choice_editor();
+        self.focus = FocusPane::Address;
+        self.address_mode = AddressMode::LiveField(index);
+        self.command = value;
+        self.command_cursor = self.command.chars().count();
+    }
+
+    pub(crate) fn request_control_confirmation(
+        &mut self,
+        index: usize,
+        label: String,
+        context: Option<String>,
+    ) {
+        self.help_open = false;
+        self.close_live_choice_editor();
+        self.close_media_picker();
+        if self.image_viewer_open {
+            self.close_image_viewer();
+        }
+        self.control_confirmation = Some(ControlConfirmation {
+            index,
+            label,
+            context,
+        });
+    }
+
+    pub(crate) fn open_live_choice_editor(&mut self, control_index: usize) {
+        let selected_index = self
+            .page
+            .live_controls
+            .get(control_index)
+            .and_then(|control| control.options.iter().position(|option| option.selected))
+            .unwrap_or(0);
+        self.help_open = false;
+        self.close_media_picker();
+        if self.image_viewer_open {
+            self.close_image_viewer();
+        }
+        self.live_choice_editor = Some(LiveChoiceEditor {
+            control_index,
+            selected_index,
+        });
+    }
+
+    pub(crate) fn close_live_choice_editor(&mut self) {
+        self.live_choice_editor = None;
+    }
+
+    pub(crate) fn move_live_choice(&mut self, delta: isize) {
+        let Some(editor) = self.live_choice_editor.as_mut() else {
+            return;
+        };
+        let Some(control) = self.page.live_controls.get(editor.control_index) else {
+            return;
+        };
+        if control.options.is_empty() {
+            editor.selected_index = 0;
+            return;
+        }
+        let len = control.options.len();
+        let mut candidate = editor.selected_index;
+        for _ in 0..len {
+            candidate = if delta < 0 {
+                if candidate == 0 {
+                    len - 1
+                } else {
+                    candidate - 1
+                }
+            } else {
+                (candidate + 1) % len
+            };
+            if !control.options[candidate].disabled {
+                editor.selected_index = candidate;
+                break;
+            }
+        }
+    }
+
+    pub(crate) fn move_live_choice_to_boundary(&mut self, end: bool) {
+        let Some(editor) = self.live_choice_editor.as_mut() else {
+            return;
+        };
+        let Some(control) = self.page.live_controls.get(editor.control_index) else {
+            return;
+        };
+        let candidate = if end {
+            control.options.iter().rposition(|option| !option.disabled)
+        } else {
+            control.options.iter().position(|option| !option.disabled)
+        };
+        if let Some(index) = candidate {
+            editor.selected_index = index;
+        }
+    }
+
+    pub(crate) fn cancel_control_confirmation(&mut self) {
+        self.control_confirmation = None;
+    }
+
     pub(crate) fn leave_address_edit(&mut self) {
         self.address_mode = AddressMode::Nav;
         self.command.clear();
@@ -246,6 +364,7 @@ impl App {
 
     pub(crate) fn open_image_viewer(&mut self) {
         self.help_open = false;
+        self.close_live_choice_editor();
         self.close_media_picker();
         self.image_viewer_open = true;
         self.image_dirty = true;
@@ -266,6 +385,7 @@ impl App {
             self.close_image_viewer();
         }
         self.help_open = false;
+        self.close_live_choice_editor();
         self.selected_media_index = self
             .selected_media_index
             .min(self.page.media.len().saturating_sub(1));
@@ -276,6 +396,7 @@ impl App {
 
     pub(crate) fn open_help(&mut self) {
         self.close_media_picker();
+        self.close_live_choice_editor();
         if self.image_viewer_open {
             self.close_image_viewer();
         }

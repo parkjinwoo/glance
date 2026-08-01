@@ -10,6 +10,7 @@ pub struct Document {
     pub links: Vec<Link>,
     pub forms: Vec<Form>,
     pub continuation_buttons: Vec<ContinuationButton>,
+    pub live_controls: Vec<LiveControl>,
     pub images: Vec<MediaRef>,
     pub media_links: Vec<MediaRef>,
     pub script_count: usize,
@@ -47,6 +48,94 @@ pub struct FormField {
 pub struct ContinuationButton {
     pub label: String,
     pub glance_id: usize,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum LiveControlKind {
+    Disclosure,
+    Action,
+    Submit,
+    Field,
+}
+
+impl LiveControlKind {
+    pub fn from_attribute(value: &str) -> Option<Self> {
+        match value {
+            "disclosure" => Some(Self::Disclosure),
+            "action" => Some(Self::Action),
+            "submit" => Some(Self::Submit),
+            "field" => Some(Self::Field),
+            _ => None,
+        }
+    }
+
+    pub fn as_attribute(self) -> &'static str {
+        match self {
+            Self::Disclosure => "disclosure",
+            Self::Action => "action",
+            Self::Submit => "submit",
+            Self::Field => "field",
+        }
+    }
+
+    pub fn requires_confirmation(self) -> bool {
+        matches!(self, Self::Action | Self::Submit)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct LiveControl {
+    pub label: String,
+    pub context: Option<String>,
+    pub value: String,
+    pub placeholder: Option<String>,
+    pub glance_id: usize,
+    pub kind: LiveControlKind,
+    pub field_kind: Option<LiveFieldKind>,
+    pub checked: bool,
+    pub options: Vec<LiveOption>,
+    pub in_layer: bool,
+    pub multiline: bool,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum LiveFieldKind {
+    Text,
+    TextArea,
+    Checkbox,
+    Radio,
+    Select,
+}
+
+impl LiveFieldKind {
+    pub fn from_attribute(value: &str) -> Option<Self> {
+        match value {
+            "text" => Some(Self::Text),
+            "textarea" => Some(Self::TextArea),
+            "checkbox" => Some(Self::Checkbox),
+            "radio" => Some(Self::Radio),
+            "select" => Some(Self::Select),
+            _ => None,
+        }
+    }
+
+    pub fn as_attribute(self) -> &'static str {
+        match self {
+            Self::Text => "text",
+            Self::TextArea => "textarea",
+            Self::Checkbox => "checkbox",
+            Self::Radio => "radio",
+            Self::Select => "select",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct LiveOption {
+    pub label: String,
+    pub value: String,
+    pub selected: bool,
+    pub disabled: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -150,6 +239,7 @@ pub fn parse_document_with_options(
     let links = collect_links(&doc, base_url);
     let forms = collect_forms(&doc, base_url);
     let continuation_buttons = collect_continuation_buttons(&doc);
+    let live_controls = collect_live_controls(&doc);
     let images = collect_images(&doc, base_url);
     let media_links = collect_media_links(&doc, base_url);
     let script_count = collect_count(&doc, "script");
@@ -163,6 +253,7 @@ pub fn parse_document_with_options(
         links,
         forms,
         continuation_buttons,
+        live_controls,
         images,
         media_links,
         script_count,
@@ -199,6 +290,22 @@ fn sanitize_document(doc: &mut Document) {
     }
     for button in &mut doc.continuation_buttons {
         button.label = sanitize_for_display(&button.label);
+    }
+    for control in &mut doc.live_controls {
+        control.label = sanitize_for_display(&control.label);
+        control.context = control
+            .context
+            .take()
+            .map(|value| sanitize_for_display(&value));
+        control.value = sanitize_multiline(&control.value);
+        control.placeholder = control
+            .placeholder
+            .take()
+            .map(|value| sanitize_for_display(&value));
+        for option in &mut control.options {
+            option.label = sanitize_for_display(&option.label);
+            option.value = sanitize_for_display(&option.value);
+        }
     }
     for media in &mut doc.images {
         media.alt_or_label = sanitize_for_display(&media.alt_or_label);
@@ -432,6 +539,9 @@ fn collect_forms(doc: &Html, base_url: &Url) -> Vec<Form> {
             });
         }
 
+        if !fields.iter().any(|field| field.editable) {
+            continue;
+        }
         let label = fields
             .iter()
             .find(|field| field.editable)
@@ -476,6 +586,157 @@ fn collect_continuation_buttons(doc: &Html) -> Vec<ContinuationButton> {
                 .unwrap_or_else(|| node.text().collect::<Vec<_>>().join(" "));
             let label = label.split_whitespace().collect::<Vec<_>>().join(" ");
             (!label.is_empty()).then_some(ContinuationButton { label, glance_id })
+        })
+        .collect()
+}
+
+fn collect_live_controls(doc: &Html) -> Vec<LiveControl> {
+    let Some(selector) = parse_selector("[data-glance-live-control][data-glance-live-kind]") else {
+        return Vec::new();
+    };
+    doc.select(&selector)
+        .filter_map(|node| {
+            if node.value().attr("disabled").is_some()
+                || node.value().attr("aria-disabled") == Some("true")
+            {
+                return None;
+            }
+            let glance_id = node
+                .value()
+                .attr("data-glance-live-control")?
+                .parse::<usize>()
+                .ok()?;
+            let kind =
+                LiveControlKind::from_attribute(node.value().attr("data-glance-live-kind")?)?;
+            let tag = node.value().name();
+            let role = node.value().attr("role").unwrap_or_default();
+            let input_type = node
+                .value()
+                .attr("type")
+                .unwrap_or("text")
+                .to_ascii_lowercase();
+            let field_kind = node
+                .value()
+                .attr("data-glance-live-field-kind")
+                .and_then(LiveFieldKind::from_attribute);
+            let supported = match (kind, field_kind) {
+                (LiveControlKind::Field, Some(LiveFieldKind::Text)) => {
+                    (tag == "input"
+                        && !matches!(
+                            input_type.as_str(),
+                            "password"
+                                | "hidden"
+                                | "file"
+                                | "button"
+                                | "submit"
+                                | "reset"
+                                | "image"
+                                | "checkbox"
+                                | "radio"
+                        ))
+                        || (tag != "input"
+                            && (role == "textbox"
+                                || node.value().attr("contenteditable") == Some("true")))
+                }
+                (LiveControlKind::Field, Some(LiveFieldKind::TextArea)) => tag == "textarea",
+                (LiveControlKind::Field, Some(LiveFieldKind::Checkbox)) => {
+                    tag == "input" && input_type == "checkbox"
+                }
+                (LiveControlKind::Field, Some(LiveFieldKind::Radio)) => {
+                    tag == "input" && input_type == "radio"
+                }
+                (LiveControlKind::Field, Some(LiveFieldKind::Select)) => {
+                    tag == "select" && node.value().attr("multiple").is_none()
+                }
+                (LiveControlKind::Field, None) => false,
+                _ => {
+                    tag == "button"
+                        || (tag == "input" && matches!(input_type.as_str(), "button" | "submit"))
+                        || matches!(role, "button" | "menuitem" | "tab" | "option")
+                }
+            };
+            if !supported {
+                return None;
+            }
+
+            let label = node
+                .value()
+                .attr("data-glance-live-label")
+                .or_else(|| node.value().attr("aria-label"))
+                .or_else(|| node.value().attr("title"))
+                .or_else(|| node.value().attr("placeholder"))
+                .or_else(|| node.value().attr("value"))
+                .map(str::to_string)
+                .unwrap_or_else(|| node.text().collect::<Vec<_>>().join(" "));
+            let label = label.split_whitespace().collect::<Vec<_>>().join(" ");
+            if label.is_empty() {
+                return None;
+            }
+            let context = node
+                .value()
+                .attr("data-glance-live-context")
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string);
+            let value = node
+                .value()
+                .attr("data-glance-live-value")
+                .unwrap_or_default()
+                .to_string();
+            let placeholder = node
+                .value()
+                .attr("placeholder")
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string);
+            let checked = node.value().attr("data-glance-live-checked") == Some("true");
+            let options = if field_kind == Some(LiveFieldKind::Select) {
+                collect_live_options(&node, &value)
+            } else {
+                Vec::new()
+            };
+            Some(LiveControl {
+                label,
+                context,
+                value,
+                placeholder,
+                glance_id,
+                kind,
+                field_kind,
+                checked,
+                options,
+                in_layer: node.value().attr("data-glance-live-layer") == Some("true"),
+                multiline: field_kind == Some(LiveFieldKind::TextArea),
+            })
+        })
+        .collect()
+}
+
+fn collect_live_options(select: &ElementRef<'_>, current_value: &str) -> Vec<LiveOption> {
+    let Some(selector) = parse_selector("option") else {
+        return Vec::new();
+    };
+    select
+        .select(&selector)
+        .map(|option| {
+            let option_text = collapsed_text(&option);
+            let value = option
+                .value()
+                .attr("value")
+                .map(ToString::to_string)
+                .unwrap_or_else(|| option_text.clone());
+            let label = if option_text.is_empty() {
+                value.clone()
+            } else {
+                option_text
+            };
+            LiveOption {
+                selected: value == current_value,
+                disabled: option.value().attr("disabled").is_some()
+                    || option.value().attr("data-glance-live-option-disabled") == Some("true"),
+                label,
+                value,
+            }
         })
         .collect()
 }
@@ -1116,7 +1377,7 @@ fn truncate_label(label: &str, max_chars: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{MarkdownBlock, MediaKind, parse_document};
+    use super::{LiveControlKind, LiveFieldKind, MarkdownBlock, MediaKind, parse_document};
     use url::Url;
 
     #[test]
@@ -1384,5 +1645,64 @@ mod tests {
         assert_eq!(doc.continuation_buttons[0].glance_id, 3);
         assert_eq!(doc.continuation_buttons[0].label, "Load more posts");
         assert_eq!(doc.continuation_buttons[1].label, "더 보기");
+    }
+
+    #[test]
+    fn extracts_only_supported_browser_tagged_live_controls() {
+        let html = r#"
+            <button data-glance-live-control="0" data-glance-live-kind="disclosure"
+                    data-glance-live-label="단문 작성" data-glance-live-context="작성">
+                ignored fallback
+            </button>
+            <textarea data-glance-live-control="1" data-glance-live-kind="field"
+                      data-glance-live-field-kind="textarea"
+                      data-glance-live-label="내용" data-glance-live-value="hello"
+                      data-glance-live-layer="true" placeholder="댓글을 입력하세요…"></textarea>
+            <div role="menuitem" data-glance-live-control="2" data-glance-live-kind="action"
+                 data-glance-live-label="공유"></div>
+            <a href="/delete" data-glance-live-control="3" data-glance-live-kind="action"
+               data-glance-live-label="Delete">Delete</a>
+            <input type="password" role="textbox" data-glance-live-control="4" data-glance-live-kind="field"
+                   data-glance-live-field-kind="text"
+                   data-glance-live-label="Password">
+            <select data-glance-live-control="5" data-glance-live-kind="field"
+                    data-glance-live-field-kind="select" data-glance-live-value="public"
+                    data-glance-live-label="Visibility">
+                <option value="public">Public</option>
+                <option value="private" data-glance-live-option-disabled="true">Private</option>
+            </select>
+            <input type="checkbox" data-glance-live-control="6" data-glance-live-kind="field"
+                   data-glance-live-field-kind="checkbox" data-glance-live-checked="true"
+                   data-glance-live-label="Notify">
+            <input type="radio" data-glance-live-control="7" data-glance-live-kind="field"
+                   data-glance-live-field-kind="radio" data-glance-live-checked="false"
+                   data-glance-live-label="Public">
+            <select multiple data-glance-live-control="8" data-glance-live-kind="field"
+                    data-glance-live-field-kind="select" data-glance-live-label="Unsupported multiple">
+                <option value="one">One</option>
+            </select>
+        "#;
+        let doc = parse_document(&Url::parse("https://example.com/").expect("url"), html);
+
+        assert_eq!(doc.live_controls.len(), 6);
+        assert_eq!(doc.live_controls[0].label, "단문 작성");
+        assert_eq!(doc.live_controls[0].context.as_deref(), Some("작성"));
+        assert_eq!(doc.live_controls[0].kind, LiveControlKind::Disclosure);
+        assert_eq!(doc.live_controls[1].value, "hello");
+        assert!(doc.live_controls[1].in_layer);
+        assert!(doc.live_controls[1].multiline);
+        assert_eq!(doc.live_controls[2].kind, LiveControlKind::Action);
+        assert!(doc.live_controls[2].kind.requires_confirmation());
+        assert_eq!(doc.live_controls[3].field_kind, Some(LiveFieldKind::Select));
+        assert_eq!(doc.live_controls[3].options.len(), 2);
+        assert!(doc.live_controls[3].options[0].selected);
+        assert!(doc.live_controls[3].options[1].disabled);
+        assert_eq!(
+            doc.live_controls[4].field_kind,
+            Some(LiveFieldKind::Checkbox)
+        );
+        assert!(doc.live_controls[4].checked);
+        assert_eq!(doc.live_controls[5].field_kind, Some(LiveFieldKind::Radio));
+        assert!(!doc.live_controls[5].checked);
     }
 }

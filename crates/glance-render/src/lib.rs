@@ -1,4 +1,4 @@
-use glance_dom::{Document, MarkdownBlock};
+use glance_dom::{Document, LiveControl, LiveControlKind, LiveFieldKind, MarkdownBlock};
 use unicode_width::UnicodeWidthStr;
 
 #[derive(Debug, Clone)]
@@ -26,6 +26,8 @@ pub enum InteractiveAction {
     OpenMedia(usize),
     OpenForm(usize),
     ActivateButton(usize),
+    EditLiveField(usize),
+    ActivateLiveControl(usize),
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -43,6 +45,48 @@ pub fn render_document(doc: &Document, icon_mode: RenderIconMode) -> RenderedPag
 
     let mut lines = Vec::new();
     let mut interactive_spans = Vec::new();
+
+    if !doc.live_controls.is_empty() {
+        let has_layer = doc.live_controls.iter().any(|control| control.in_layer);
+        let context = doc
+            .live_controls
+            .iter()
+            .find(|control| !has_layer || control.in_layer)
+            .and_then(|control| control.context.as_deref())
+            .filter(|context| !context.is_empty());
+        lines.push(match (has_layer, context) {
+            (true, Some(context)) => format!("╭─ ACTIVE PANEL · {context}"),
+            (true, None) => "╭─ ACTIVE PANEL".to_string(),
+            (false, Some(context)) => format!("╭─ PAGE CONTROLS · {context}"),
+            (false, None) => "╭─ PAGE CONTROLS".to_string(),
+        });
+        for (i, control) in doc
+            .live_controls
+            .iter()
+            .enumerate()
+            .filter(|(_, control)| !has_layer || control.in_layer)
+        {
+            let action = if control.kind == LiveControlKind::Field {
+                InteractiveAction::EditLiveField(i)
+            } else {
+                InteractiveAction::ActivateLiveControl(i)
+            };
+            let token = live_control_token(control, i, icon_mode);
+            let detail = live_control_detail(control);
+            let line = format!("{token}  {}{detail}", control.label);
+            let line_idx = lines.len();
+            let line_width = UnicodeWidthStr::width(line.as_str()) as u16;
+            lines.push(line);
+            interactive_spans.push(InteractiveSpan {
+                line: line_idx,
+                col_start: 0,
+                col_end: line_width,
+                action,
+            });
+        }
+        lines.push("╰─".to_string());
+        lines.push(String::new());
+    }
 
     if !doc.forms.is_empty() {
         for (i, form) in doc.forms.iter().enumerate() {
@@ -144,6 +188,85 @@ pub fn render_document(doc: &Document, icon_mode: RenderIconMode) -> RenderedPag
         links,
         media,
         interactive_spans,
+    }
+}
+
+fn live_control_token(control: &LiveControl, index: usize, icon_mode: RenderIconMode) -> String {
+    if icon_mode == RenderIconMode::Ascii {
+        return match control.field_kind {
+            Some(LiveFieldKind::Checkbox) => {
+                if control.checked { "[x]" } else { "[ ]" }.to_string()
+            }
+            Some(LiveFieldKind::Radio) => if control.checked { "(*)" } else { "( )" }.to_string(),
+            Some(LiveFieldKind::Select) => "[v]".to_string(),
+            Some(LiveFieldKind::Text | LiveFieldKind::TextArea) => "[>]".to_string(),
+            None => interactive_token(
+                if control.kind == LiveControlKind::Field {
+                    InteractiveAction::EditLiveField(index)
+                } else {
+                    InteractiveAction::ActivateLiveControl(index)
+                },
+                index,
+                icon_mode,
+            ),
+        };
+    }
+    match control.field_kind {
+        Some(LiveFieldKind::Text) => "✎".to_string(),
+        Some(LiveFieldKind::TextArea) => "▤".to_string(),
+        Some(LiveFieldKind::Checkbox) => if control.checked { "☑" } else { "☐" }.to_string(),
+        Some(LiveFieldKind::Radio) => if control.checked { "◉" } else { "○" }.to_string(),
+        Some(LiveFieldKind::Select) => "▾".to_string(),
+        None => match control.kind {
+            LiveControlKind::Disclosure => "›".to_string(),
+            LiveControlKind::Action => "●".to_string(),
+            LiveControlKind::Submit => "✓".to_string(),
+            LiveControlKind::Field => "✎".to_string(),
+        },
+    }
+}
+
+fn live_control_detail(control: &LiveControl) -> String {
+    match control.field_kind {
+        Some(LiveFieldKind::Text | LiveFieldKind::TextArea) => {
+            let value = control.value.lines().next().unwrap_or_default().trim();
+            let detail = if value.is_empty() {
+                control.placeholder.as_deref().unwrap_or_default()
+            } else {
+                value
+            };
+            if detail.is_empty() {
+                String::new()
+            } else {
+                format!("  ·  {}", compact_label(detail, 72))
+            }
+        }
+        Some(LiveFieldKind::Select) => {
+            let label = control
+                .options
+                .iter()
+                .find(|option| option.selected)
+                .map(|option| option.label.as_str())
+                .unwrap_or(control.value.as_str());
+            if label.is_empty() {
+                String::new()
+            } else {
+                format!("  ·  {}", compact_label(label, 48))
+            }
+        }
+        Some(LiveFieldKind::Checkbox | LiveFieldKind::Radio) => String::new(),
+        None if control.kind.requires_confirmation() => "  [confirm]".to_string(),
+        None => String::new(),
+    }
+}
+
+fn compact_label(value: &str, max_chars: usize) -> String {
+    let mut chars = value.chars();
+    let compact = chars.by_ref().take(max_chars).collect::<String>();
+    if chars.next().is_some() {
+        format!("{compact}…")
+    } else {
+        compact
     }
 }
 
@@ -278,6 +401,8 @@ fn interactive_token(action: InteractiveAction, index: usize, icon_mode: RenderI
             InteractiveAction::OpenMedia(_) => format!("󰕧{n}"),
             InteractiveAction::OpenForm(_) => format!("󰘎{n}"),
             InteractiveAction::ActivateButton(_) => format!("󰐕{n}"),
+            InteractiveAction::EditLiveField(_) => format!("󰘎{n}"),
+            InteractiveAction::ActivateLiveControl(_) => format!("󰐕{n}"),
         },
         RenderIconMode::Ascii => match action {
             InteractiveAction::OpenLink(_) => format!("[L{n}]"),
@@ -285,6 +410,8 @@ fn interactive_token(action: InteractiveAction, index: usize, icon_mode: RenderI
             InteractiveAction::OpenMedia(_) => format!("[M{n}]"),
             InteractiveAction::OpenForm(_) => format!("[F{n}]"),
             InteractiveAction::ActivateButton(_) => format!("[+{n}]"),
+            InteractiveAction::EditLiveField(_) => format!("[E{n}]"),
+            InteractiveAction::ActivateLiveControl(_) => format!("[A{n}]"),
         },
     }
 }
@@ -432,5 +559,37 @@ mod tests {
         let doc = parse_document(&base, html);
         let rendered = render_document(&doc, RenderIconMode::Auto);
         assert!(rendered.lines.iter().any(|l| l.starts_with("󰌹1 ")));
+    }
+
+    #[test]
+    fn renders_live_fields_and_confirmable_actions_first() {
+        let html = r#"
+            <main><p>Post body</p></main>
+            <textarea data-glance-live-control="0" data-glance-live-kind="field"
+                      data-glance-live-field-kind="textarea"
+                      data-glance-live-label="내용" data-glance-live-value="draft"
+                      data-glance-live-layer="true" placeholder="댓글을 입력하세요…"></textarea>
+            <button data-glance-live-control="1" data-glance-live-kind="action"
+                    data-glance-live-label="공유" data-glance-live-layer="true">공유</button>
+        "#;
+        let base = Url::parse("https://example.com/post").expect("url");
+        let doc = parse_document(&base, html);
+        let rendered = render_document(&doc, RenderIconMode::Ascii);
+
+        assert_eq!(rendered.lines[0], "╭─ ACTIVE PANEL");
+        assert!(rendered.lines[1].starts_with("[>]  내용"));
+        assert!(rendered.lines[2].contains("[A2]  공유  [confirm]"));
+        assert!(
+            rendered
+                .interactive_spans
+                .iter()
+                .any(|span| { matches!(span.action, InteractiveAction::EditLiveField(0)) })
+        );
+        assert!(
+            rendered
+                .interactive_spans
+                .iter()
+                .any(|span| { matches!(span.action, InteractiveAction::ActivateLiveControl(1)) })
+        );
     }
 }

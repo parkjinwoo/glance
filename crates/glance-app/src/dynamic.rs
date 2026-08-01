@@ -116,6 +116,7 @@ pub(crate) async fn render_with_browser(
         // Interactive continuation tags are trusted only when our connected companion
         // has cleared and regenerated them immediately before the snapshot.
         document.continuation_buttons.clear();
+        document.live_controls.clear();
         let rendered = render_document(&document, render_icon_mode);
         DynamicPage { document, rendered }
     })

@@ -27,6 +27,11 @@ page execution to an installed Chromium-family browser and clearly marks the res
   resources even when the site virtualizes older DOM nodes.
 - Label-allowlisted `Load more`/`Show more` controls from a live page appear at the end of the
   reader and can be activated directly. This is an accidental-action guard, not a trust boundary.
+- Connected pages expose visible, accessible Chromium controls as compact form cards. Dialogs and
+  menus move into an `ACTIVE LAYER`; text and multiline fields use an overlay editor, native
+  checkbox/radio controls toggle in place, and native single-selects open a keyboard-and-mouse
+  choice panel. State-changing actions such as posting, sharing, reacting, or bookmarking require
+  a separate confirmation.
 - Address-or-search omnibox with a configurable search provider.
 - Back/forward history with per-page scroll restoration.
 - Keyboard and mouse activation for links, images, media, and simple GET forms.
@@ -75,7 +80,7 @@ cargo install --path crates/glance-app --locked
 | `n`, `N` | Next/previous find match; without a find, `n` pages down |
 | `j`/`k`, arrows | Move the content cursor |
 | `Space`, `PageDown`/`PageUp` | Move by one page; extending a connected live feed near its edge |
-| `Enter` | Open the link, image, media item, form, or safe continuation control at the cursor |
+| `Enter` | Open the selected link, media, form, continuation, live field, button, or menu item |
 | `b` / `f` | Back / forward |
 | `r` | Reload |
 | `d` | Re-render the current page through headless Chromium |
@@ -94,6 +99,11 @@ Mouse controls:
 
 - Hover an actionable item to preview its type, label, and destination.
 - Left-click activates on button release, so dragging does not accidentally open a link.
+- Live dialogs, menus, fields, and buttons use the same release-to-activate behavior. Actions that
+  may change site state open a confirmation card; `Enter`/`y` confirms and `Esc`/`n` cancels.
+- Text fields open a focused editor. `Enter` applies a single-line value; in a textarea, `Enter`
+  inserts a newline and `Ctrl-Enter` applies. Checkbox/radio fields toggle directly, while native
+  single-selects open a choice card navigable by arrows, `j`/`k`, wheel, click, Enter, or Space.
 - Drag in the content pane to move the cursor; drag the right scrollbar for fast navigation.
 - Wheel scrolls three lines, Shift-wheel eight lines, and Ctrl-wheel one page. Near the end of an
   authenticated live page it also requests the next browser-backed feed segment.
@@ -190,6 +200,18 @@ avoid unbounded terminal-session memory growth. `:more` explicitly requests the 
 When a site instead requires an explicit read-only continuation action, matching controls such as
 `Load more posts` appear after the readable content and can be activated with Enter or a click.
 Floating cards distinguish DOM/feed work in progress from successful or failed completion.
+
+Visible controls in the connected Chromium page are projected into a `LIVE CONTROLS` section.
+Opening a menu or dialog promotes its contents to `ACTIVE LAYER`, so compose fields, comment
+editors, share/quote menus, reaction pickers, and similar portal-based interfaces remain reachable.
+Editing text or textarea fields, toggling native checkbox/radio inputs, and choosing native
+single-select options update Chromium through the browser's own element setters/events and refresh
+the snapshot.
+Disclosure controls open immediately; actions and submits require an explicit confirmation and are
+revalidated for type, identity, visibility, enabled state, and origin immediately before Chromium
+receives the interaction. Password, hidden, and file inputs are never projected into the TUI;
+custom comboboxes remain browser-backed disclosure/listbox interactions rather than being treated
+as native selects.
 
 The companion keeps Chromium's sandbox enabled, respects TLS errors, denies downloads, binds its
 DevTools endpoint to `127.0.0.1` on a random port, validates that endpoint before use, and never

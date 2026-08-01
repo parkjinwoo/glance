@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8">
+    <title>Glance live controls fixture</title>
+    <style>
+      [hidden] { display: none !important; }
+      body { font-family: sans-serif; }
+      dialog[open], [role="menu"] { display: block; border: 1px solid #888; padding: 1rem; }
+      .visually-hidden-control { position: absolute; width: 0; height: 0; opacity: 0; }
+    </style>
+  </head>
+  <body>
+    <nav aria-label="작성">
+      <button id="compose">단문 작성</button>
+      <a id="account" href="companion_auth.html?target=companion_controls.html">Sign in</a>
+    </nav>
+    <main>
+      <article>
+        <h1>Live controls</h1>
+        <button id="share" type="button" aria-haspopup="true" aria-expanded="false">공유 또는 인용</button>
+        <button id="reaction" type="button">반응</button>
+        <div id="reactions" hidden>
+          <button type="button" data-count="3">❤️ 3</button>
+          <button type="button">🎉</button>
+        </div>
+      </article>
+      <form id="reply">
+        <label for="reply-body">내용</label>
+        <textarea id="reply-body" name="body" placeholder="댓글을 입력하세요…"></textarea>
+        <label><input class="visually-hidden-control" type="checkbox" name="notify" checked> 답글 알림</label>
+        <fieldset>
+          <legend>공개 범위</legend>
+          <label><input type="radio" name="visibility" value="public" checked> 공개</label>
+          <label><input type="radio" name="visibility" value="followers"> 팔로워</label>
+        </fieldset>
+        <label for="language">언어</label>
+        <select id="language" name="language">
+          <option value="ko" selected>한국어</option>
+          <option value="en">English</option>
+          <option value="ja" disabled>日本語 (disabled)</option>
+        </select>
+        <button type="submit">단문 작성</button>
+      </form>
+      <p id="result">No action yet</p>
+    </main>
+
+    <div id="share-menu" role="menu" aria-label="공유 또는 인용" hidden>
+      <div role="menuitem" tabindex="0">공유</div>
+      <div role="menuitem" tabindex="0" id="quote">인용</div>
+    </div>
+    <dialog id="composer" aria-label="단문 작성">
+      <h2>단문 작성</h2>
+      <label for="post-body">내용</label>
+      <textarea id="post-body" placeholder="무슨 생각 해요?"></textarea>
+      <button type="button" id="cancel">취소</button>
+      <button type="submit">단문 작성</button>
+    </dialog>
+
+    <script>
+      const compose = document.querySelector('#compose');
+      const composer = document.querySelector('#composer');
+      const share = document.querySelector('#share');
+      const shareMenu = document.querySelector('#share-menu');
+      const reaction = document.querySelector('#reaction');
+      const reactions = document.querySelector('#reactions');
+      const account = document.querySelector('#account');
+
+      if (localStorage.getItem('glance-fixture-authenticated') === 'yes') {
+        account.textContent = 'Sign out';
+        account.href = '#sign-out';
+      }
+
+      compose.addEventListener('click', () => composer.showModal());
+      document.querySelector('#cancel').addEventListener('click', () => composer.close());
+      share.addEventListener('click', () => {
+        const opening = shareMenu.hidden;
+        shareMenu.hidden = !opening;
+        share.setAttribute('aria-expanded', String(opening));
+      });
+      reaction.addEventListener('click', () => { reactions.hidden = !reactions.hidden; });
+      document.querySelector('#quote').addEventListener('click', () => composer.showModal());
+      document.querySelector('#reply').addEventListener('submit', event => {
+        event.preventDefault();
+        const values = new FormData(event.currentTarget);
+        document.querySelector('#result').textContent = [
+          'Reply submitted',
+          `body=${values.get('body')}`,
+          `notify=${values.has('notify')}`,
+          `visibility=${values.get('visibility')}`,
+          `language=${values.get('language')}`,
+        ].join(' · ');
+      });
+    </script>
+  </body>
+</html>

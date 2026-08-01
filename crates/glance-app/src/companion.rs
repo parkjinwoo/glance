@@ -17,6 +17,8 @@ use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout};
 use url::Url;
 
+use glance_dom::{LiveControlKind, LiveFieldKind};
+
 #[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 
@@ -43,6 +45,8 @@ pub(crate) enum CompanionOperation {
     Observe,
     Scroll,
     Activate,
+    ActivateLive,
+    FillLive,
 }
 
 #[derive(Debug)]
@@ -50,6 +54,7 @@ pub(crate) struct CompanionSnapshot {
     pub(crate) url: Url,
     pub(crate) html: String,
     pub(crate) scroll: Option<CompanionScroll>,
+    pub(crate) can_scroll: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -83,13 +88,47 @@ pub(crate) enum CompanionEvent {
 }
 
 enum CompanionCommand {
-    Authenticate { request_id: u64, url: Url },
-    FocusAuth { request_id: u64 },
-    Navigate { request_id: u64, url: Url },
-    Observe { request_id: u64 },
-    Scroll { request_id: u64 },
-    Activate { request_id: u64, glance_id: usize },
-    Shutdown { done: oneshot::Sender<()> },
+    Authenticate {
+        request_id: u64,
+        url: Url,
+    },
+    FocusAuth {
+        request_id: u64,
+    },
+    Navigate {
+        request_id: u64,
+        url: Url,
+    },
+    Observe {
+        request_id: u64,
+    },
+    Scroll {
+        request_id: u64,
+    },
+    Activate {
+        request_id: u64,
+        expected_url: Url,
+        glance_id: usize,
+        label: String,
+    },
+    ActivateLive {
+        request_id: u64,
+        expected_url: Url,
+        glance_id: usize,
+        kind: LiveControlKind,
+        label: String,
+    },
+    FillLive {
+        request_id: u64,
+        expected_url: Url,
+        glance_id: usize,
+        field_kind: LiveFieldKind,
+        label: String,
+        value: Option<String>,
+    },
+    Shutdown {
+        done: oneshot::Sender<()>,
+    },
 }
 
 pub(crate) struct CompanionClient {
@@ -140,11 +179,79 @@ impl CompanionClient {
             .map_err(|_| anyhow!("secure browser session is unavailable"))
     }
 
-    pub(crate) fn activate(&self, request_id: u64, glance_id: usize) -> Result<()> {
+    pub(crate) fn activate(
+        &self,
+        request_id: u64,
+        expected_url: Url,
+        glance_id: usize,
+        label: String,
+    ) -> Result<()> {
         self.command_tx
             .send(CompanionCommand::Activate {
                 request_id,
+                expected_url,
                 glance_id,
+                label,
+            })
+            .map_err(|_| anyhow!("secure browser session is unavailable"))
+    }
+
+    pub(crate) fn activate_live(
+        &self,
+        request_id: u64,
+        expected_url: Url,
+        glance_id: usize,
+        kind: LiveControlKind,
+        label: String,
+    ) -> Result<()> {
+        self.command_tx
+            .send(CompanionCommand::ActivateLive {
+                request_id,
+                expected_url,
+                glance_id,
+                kind,
+                label,
+            })
+            .map_err(|_| anyhow!("secure browser session is unavailable"))
+    }
+
+    pub(crate) fn fill_live(
+        &self,
+        request_id: u64,
+        expected_url: Url,
+        glance_id: usize,
+        field_kind: LiveFieldKind,
+        label: String,
+        value: String,
+    ) -> Result<()> {
+        self.command_tx
+            .send(CompanionCommand::FillLive {
+                request_id,
+                expected_url,
+                glance_id,
+                field_kind,
+                label,
+                value: Some(value),
+            })
+            .map_err(|_| anyhow!("secure browser session is unavailable"))
+    }
+
+    pub(crate) fn toggle_live(
+        &self,
+        request_id: u64,
+        expected_url: Url,
+        glance_id: usize,
+        field_kind: LiveFieldKind,
+        label: String,
+    ) -> Result<()> {
+        self.command_tx
+            .send(CompanionCommand::FillLive {
+                request_id,
+                expected_url,
+                glance_id,
+                field_kind,
+                label,
+                value: None,
             })
             .map_err(|_| anyhow!("secure browser session is unavailable"))
     }
@@ -309,13 +416,20 @@ async fn run_actor(
             }
             CompanionCommand::Activate {
                 request_id,
+                expected_url,
                 glance_id,
+                label,
             } => {
                 let operation_config = config.clone();
                 let result = with_session(&config, &mut session, move |live| {
                     Box::pin(async move {
-                        live.activate_and_snapshot(glance_id, &operation_config)
-                            .await
+                        live.activate_and_snapshot(
+                            &expected_url,
+                            glance_id,
+                            &label,
+                            &operation_config,
+                        )
+                        .await
                     })
                 })
                 .await;
@@ -329,6 +443,79 @@ async fn run_actor(
                     }
                     Err(error) => {
                         send_failure(&event_tx, request_id, CompanionOperation::Activate, error)
+                    }
+                }
+            }
+            CompanionCommand::ActivateLive {
+                request_id,
+                expected_url,
+                glance_id,
+                kind,
+                label,
+            } => {
+                let operation_config = config.clone();
+                let result = with_session(&config, &mut session, move |live| {
+                    Box::pin(async move {
+                        live.activate_live_and_snapshot(
+                            &expected_url,
+                            glance_id,
+                            kind,
+                            &label,
+                            &operation_config,
+                        )
+                        .await
+                    })
+                })
+                .await;
+                match result {
+                    Ok(snapshot) => {
+                        let _ = event_tx.send(CompanionEvent::Snapshot {
+                            request_id,
+                            operation: CompanionOperation::ActivateLive,
+                            snapshot,
+                        });
+                    }
+                    Err(error) => send_failure(
+                        &event_tx,
+                        request_id,
+                        CompanionOperation::ActivateLive,
+                        error,
+                    ),
+                }
+            }
+            CompanionCommand::FillLive {
+                request_id,
+                expected_url,
+                glance_id,
+                field_kind,
+                label,
+                value,
+            } => {
+                let operation_config = config.clone();
+                let result = with_session(&config, &mut session, move |live| {
+                    Box::pin(async move {
+                        live.update_live_field_and_snapshot(
+                            &expected_url,
+                            glance_id,
+                            field_kind,
+                            &label,
+                            value.as_deref(),
+                            &operation_config,
+                        )
+                        .await
+                    })
+                })
+                .await;
+                match result {
+                    Ok(snapshot) => {
+                        let _ = event_tx.send(CompanionEvent::Snapshot {
+                            request_id,
+                            operation: CompanionOperation::FillLive,
+                            snapshot,
+                        });
+                    }
+                    Err(error) => {
+                        send_failure(&event_tx, request_id, CompanionOperation::FillLive, error)
                     }
                 }
             }
@@ -510,23 +697,31 @@ impl LiveSession {
 
     async fn activate_and_snapshot(
         &mut self,
+        expected_url: &Url,
         glance_id: usize,
+        expected_label: &str,
         config: &CompanionConfig,
     ) -> Result<CompanionSnapshot> {
         let page = self
             .page
             .as_ref()
             .context("secure browser has no active page")?;
+        ensure_action_page(page, expected_url).await?;
         let fallback = page
             .url()
             .await
             .context("failed to inspect secure browser URL")?
             .and_then(|raw| Url::parse(&raw).ok())
             .context("secure browser returned no valid page URL")?;
+        let expected_url = serde_json::to_string(expected_url.as_str())
+            .context("failed to encode the continuation page URL")?;
+        let expected_label = serde_json::to_string(expected_label)
+            .context("failed to encode the continuation label")?;
         let script = format!(
             r#"() => {{
+                if (location.href !== {expected_url}) return false;
                 const el = document.querySelector('[data-glance-continuation="{glance_id}"]');
-                if (!el || el.disabled || el.getAttribute('aria-disabled') === 'true') return false;
+                if (!el || el.matches(':disabled') || el.getAttribute('aria-disabled') === 'true') return false;
                 if (!el.matches('button, [role="button"], input[type="button"], input[type="submit"]')) return false;
                 const style = getComputedStyle(el);
                 const rect = el.getBoundingClientRect();
@@ -539,6 +734,7 @@ impl LiveSession {
                     /^(?:더\s*(?:보기|불러오기|읽기)|더 많은\s*(?:게시물|글|댓글|답글|콘텐츠|결과)|이전 게시물|다음 페이지|계속 보기)$/,
                     /^(?:もっと見る|さらに表示|次へ)$/, /^(?:加载更多|顯示更多|显示更多|更多内容)$/
                 ];
+                if (label !== {expected_label}) return false;
                 if (!patterns.some(pattern => pattern.test(label))) return false;
                 el.click();
                 return true;
@@ -552,6 +748,180 @@ impl LiveSession {
             .context("secure browser returned an invalid activation result")?;
         ensure!(activated, "continuation control is no longer available");
         wait_for_feed_settle(page, config.settle_ms).await?;
+        snapshot_page(page, &fallback, config.max_body_bytes, None).await
+    }
+
+    async fn activate_live_and_snapshot(
+        &mut self,
+        expected_url: &Url,
+        glance_id: usize,
+        kind: LiveControlKind,
+        expected_label: &str,
+        config: &CompanionConfig,
+    ) -> Result<CompanionSnapshot> {
+        ensure!(
+            kind != LiveControlKind::Field,
+            "a field cannot be activated as a button"
+        );
+        let page = self
+            .page
+            .as_ref()
+            .context("secure browser has no active page")?;
+        ensure_action_page(page, expected_url).await?;
+        let fallback = page
+            .url()
+            .await
+            .context("failed to inspect secure browser URL")?
+            .and_then(|raw| Url::parse(&raw).ok())
+            .context("secure browser returned no valid page URL")?;
+        let expected_label = serde_json::to_string(expected_label)
+            .context("failed to encode the live control label")?;
+        let expected_kind = serde_json::to_string(kind.as_attribute())
+            .context("failed to encode the live control kind")?;
+        let expected_url = serde_json::to_string(expected_url.as_str())
+            .context("failed to encode the live control page URL")?;
+        let script = format!(
+            r#"() => {{
+                if (location.href !== {expected_url}) return false;
+                const el = document.querySelector('[data-glance-live-control="{glance_id}"]');
+                if (!el || el.matches(':disabled') || el.getAttribute('aria-disabled') === 'true') return false;
+                if (!el.matches('button, [role="button"], [role="menuitem"], [role="tab"], [role="option"], input[type="button"], input[type="submit"]')) return false;
+                if (el.getAttribute('data-glance-live-kind') !== {expected_kind}) return false;
+                const style = getComputedStyle(el);
+                const rect = el.getBoundingClientRect();
+                if (style.visibility === 'hidden' || style.display === 'none' || rect.width <= 0 || rect.height <= 0) return false;
+                const label = (el.getAttribute('data-glance-live-label') || el.getAttribute('aria-label') || el.innerText || el.value || el.title || '').replace(/\s+/g, ' ').trim();
+                if (label !== {expected_label}) return false;
+                el.click();
+                return true;
+            }}"#
+        );
+        let activated: bool = page
+            .evaluate(script)
+            .await
+            .context("failed to activate the live control")?
+            .into_value()
+            .context("secure browser returned an invalid live activation result")?;
+        ensure!(activated, "live control is no longer available");
+        wait_for_interaction_settle(
+            page,
+            config.settle_ms,
+            if kind.requires_confirmation() {
+                Duration::from_millis(1_800)
+            } else {
+                Duration::from_millis(450)
+            },
+        )
+        .await?;
+        snapshot_page(page, &fallback, config.max_body_bytes, None).await
+    }
+
+    async fn update_live_field_and_snapshot(
+        &mut self,
+        expected_url: &Url,
+        glance_id: usize,
+        field_kind: LiveFieldKind,
+        expected_label: &str,
+        value: Option<&str>,
+        config: &CompanionConfig,
+    ) -> Result<CompanionSnapshot> {
+        if let Some(value) = value {
+            ensure!(
+                value.len() <= 64 * 1024,
+                "live field input exceeds the 64 KiB editing limit"
+            );
+        }
+        ensure!(
+            matches!(
+                (field_kind, value),
+                (
+                    LiveFieldKind::Text | LiveFieldKind::TextArea | LiveFieldKind::Select,
+                    Some(_)
+                ) | (LiveFieldKind::Checkbox | LiveFieldKind::Radio, None)
+            ),
+            "live field update does not match the field type"
+        );
+        let page = self
+            .page
+            .as_ref()
+            .context("secure browser has no active page")?;
+        ensure_action_page(page, expected_url).await?;
+        let fallback = page
+            .url()
+            .await
+            .context("failed to inspect secure browser URL")?
+            .and_then(|raw| Url::parse(&raw).ok())
+            .context("secure browser returned no valid page URL")?;
+        let expected_label = serde_json::to_string(expected_label)
+            .context("failed to encode the live field label")?;
+        let expected_field_kind = serde_json::to_string(field_kind.as_attribute())
+            .context("failed to encode the live field kind")?;
+        let expected_url = serde_json::to_string(expected_url.as_str())
+            .context("failed to encode the live field page URL")?;
+        let value =
+            serde_json::to_string(&value).context("failed to encode the live field value")?;
+        let script = format!(
+            r#"() => {{
+                if (location.href !== {expected_url}) return false;
+                const el = document.querySelector('[data-glance-live-control="{glance_id}"]');
+                if (!el || el.matches(':disabled') || el.readOnly || el.getAttribute('aria-disabled') === 'true') return false;
+                if (el.getAttribute('data-glance-live-kind') !== 'field') return false;
+                if (el.getAttribute('data-glance-live-field-kind') !== {expected_field_kind}) return false;
+                const type = (el.getAttribute('type') || 'text').toLowerCase();
+                const fieldKind = {expected_field_kind};
+                const supported = fieldKind === 'text'
+                    ? ((el.matches('input') && !['password', 'hidden', 'file', 'button', 'submit', 'reset', 'image', 'checkbox', 'radio'].includes(type)) || (!el.matches('input') && el.matches('[role="textbox"], [contenteditable="true"]')))
+                    : fieldKind === 'textarea' ? el.matches('textarea')
+                    : fieldKind === 'checkbox' ? el.matches('input[type="checkbox"]')
+                    : fieldKind === 'radio' ? el.matches('input[type="radio"]')
+                    : fieldKind === 'select' ? el.matches('select:not([multiple])')
+                    : false;
+                if (!supported) return false;
+                const style = getComputedStyle(el);
+                const rect = el.getBoundingClientRect();
+                const directlyVisible = style.visibility !== 'hidden' && style.display !== 'none' && rect.width > 0 && rect.height > 0;
+                if (!directlyVisible) {{
+                    const labelNode = (fieldKind === 'checkbox' || fieldKind === 'radio') ? el.labels?.[0] : null;
+                    if (!labelNode) return false;
+                    const labelStyle = getComputedStyle(labelNode);
+                    const labelRect = labelNode.getBoundingClientRect();
+                    if (labelStyle.visibility === 'hidden' || labelStyle.display === 'none' || labelRect.width <= 0 || labelRect.height <= 0) return false;
+                }}
+                const label = (el.getAttribute('data-glance-live-label') || el.getAttribute('aria-label') || el.getAttribute('placeholder') || el.title || '').replace(/\s+/g, ' ').trim();
+                if (label !== {expected_label}) return false;
+                el.focus();
+                if (fieldKind === 'checkbox' || fieldKind === 'radio') {{
+                    el.click();
+                    return true;
+                }}
+                const nextValue = {value};
+                if (typeof nextValue !== 'string') return false;
+                if (fieldKind === 'select') {{
+                    const option = [...el.options].find(option => option.value === nextValue && !option.matches(':disabled'));
+                    if (!option) return false;
+                    const setter = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value')?.set;
+                    if (setter) setter.call(el, nextValue); else el.value = nextValue;
+                }} else if ('value' in el) {{
+                    const prototype = el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+                    const setter = Object.getOwnPropertyDescriptor(prototype, 'value')?.set;
+                    if (setter) setter.call(el, nextValue); else el.value = nextValue;
+                }} else {{
+                    el.textContent = nextValue;
+                }}
+                el.dispatchEvent(new InputEvent('input', {{bubbles: true, composed: true, data: nextValue, inputType: 'insertText'}}));
+                el.dispatchEvent(new Event('change', {{bubbles: true, composed: true}}));
+                el.blur();
+                return true;
+            }}"#
+        );
+        let filled: bool = page
+            .evaluate(script)
+            .await
+            .context("failed to edit the live field")?
+            .into_value()
+            .context("secure browser returned an invalid live field result")?;
+        ensure!(filled, "live field is no longer available");
+        wait_for_interaction_settle(page, config.settle_ms, Duration::from_millis(450)).await?;
         snapshot_page(page, &fallback, config.max_body_bytes, None).await
     }
 
@@ -611,6 +981,15 @@ async fn current_page_url(page: &Page, fallback: &Url) -> Result<Url> {
         .context("secure browser returned no valid page URL")
 }
 
+async fn ensure_action_page(page: &Page, expected: &Url) -> Result<()> {
+    let current = current_page_url(page, expected).await?;
+    ensure!(
+        current == *expected,
+        "secure browser page changed before the live control could run"
+    );
+    Ok(())
+}
+
 async fn snapshot_page(
     page: &Page,
     fallback: &Url,
@@ -638,6 +1017,12 @@ async fn snapshot_page(
         .context("failed to identify safe continuation controls")?
         .into_value()
         .context("secure browser returned an invalid continuation count")?;
+    let _: usize = page
+        .evaluate(TAG_LIVE_CONTROLS_SCRIPT)
+        .await
+        .context("failed to identify live page controls")?
+        .into_value()
+        .context("secure browser returned an invalid live control count")?;
     let html = page
         .content()
         .await
@@ -646,7 +1031,17 @@ async fn snapshot_page(
         html.len() <= max_body_bytes,
         "secure browser DOM exceeds configured network.max_body_bytes ({max_body_bytes} bytes)"
     );
-    Ok(CompanionSnapshot { url, html, scroll })
+    let metrics = scroll_metrics(page).await?;
+    Ok(CompanionSnapshot {
+        url,
+        html,
+        scroll,
+        can_scroll: is_scrollable_metrics(metrics),
+    })
+}
+
+fn is_scrollable_metrics([_, viewport, extent]: [f64; 3]) -> bool {
+    viewport.is_finite() && extent.is_finite() && viewport > 0.0 && extent > viewport + 32.0
 }
 
 const SCROLL_TARGET_SCRIPT: &str = r#"() => {
@@ -690,6 +1085,109 @@ const TAG_CONTINUATION_BUTTONS_SCRIPT: &str = r#"() => {
         const label = (node.getAttribute('aria-label') || node.innerText || node.value || node.title || '').replace(/\s+/g, ' ').trim();
         if (!label || !patterns.some(pattern => pattern.test(label))) continue;
         node.setAttribute('data-glance-continuation', String(count));
+        count += 1;
+    }
+    return count;
+}"#;
+
+const TAG_LIVE_CONTROLS_SCRIPT: &str = r#"() => {
+    const attributes = [
+        'data-glance-live-control', 'data-glance-live-kind', 'data-glance-live-label',
+        'data-glance-live-field-kind', 'data-glance-live-context', 'data-glance-live-value',
+        'data-glance-live-checked', 'data-glance-live-layer', 'data-glance-live-option-disabled'
+    ];
+    for (const node of document.querySelectorAll('[data-glance-live-control], [data-glance-live-kind], [data-glance-live-label], [data-glance-live-field-kind], [data-glance-live-context], [data-glance-live-value], [data-glance-live-checked], [data-glance-live-layer], [data-glance-live-option-disabled]')) {
+        for (const attribute of attributes) node.removeAttribute(attribute);
+    }
+    const clean = value => String(value || '').replace(/\s+/g, ' ').trim();
+    const layerFor = node => node.closest('[role="dialog"], [role="menu"], [role="listbox"], dialog');
+    const visible = node => {
+        if (node.matches(':disabled') || node.getAttribute('aria-disabled') === 'true') return false;
+        if (node.parentElement?.closest('[hidden], [inert], [aria-hidden="true"]')) return false;
+        const style = getComputedStyle(node);
+        const rect = node.getBoundingClientRect();
+        if (style.visibility !== 'hidden' && style.display !== 'none' && rect.width > 0 && rect.height > 0) return true;
+        const type = (node.getAttribute('type') || '').toLowerCase();
+        const label = (type === 'checkbox' || type === 'radio') ? node.labels?.[0] : null;
+        if (!label) return false;
+        const labelStyle = getComputedStyle(label);
+        const labelRect = label.getBoundingClientRect();
+        return labelStyle.visibility !== 'hidden' && labelStyle.display !== 'none' && labelRect.width > 0 && labelRect.height > 0;
+    };
+    const labelFor = node => clean(
+        node.getAttribute('aria-label') ||
+        node.labels?.[0]?.innerText ||
+        node.getAttribute('title') ||
+        node.getAttribute('placeholder') ||
+        node.innerText || node.value
+    ).slice(0, 160);
+    const contextFor = node => {
+        const layer = layerFor(node);
+        const region = layer || node.closest('form, article, nav, aside, section, [role="region"]');
+        if (!region) return ['', false];
+        const heading = region.querySelector('h1, h2, h3, [role="heading"]');
+        const context = clean(region.getAttribute('aria-label') || heading?.innerText).slice(0, 120);
+        return [context, Boolean(layer)];
+    };
+    const fieldSelector = 'textarea, select, input, [role="textbox"], [contenteditable="true"]';
+    const buttonSelector = 'button, [role="button"], [role="menuitem"], [role="tab"], [role="option"], input[type="button"], input[type="submit"]';
+    const nodes = [...document.querySelectorAll(`${fieldSelector}, ${buttonSelector}`)]
+        .sort((left, right) => Number(Boolean(layerFor(right))) - Number(Boolean(layerFor(left))));
+    const disclosurePattern = /^(?:compose|new post|write post|write note|quote|react|reactions?|options?|more options|close|cancel|dismiss|show suggestions|단문\s*작성|글\s*쓰기|인용|반응|선택지|취소|닫기)$/i;
+    let count = 0;
+    for (const node of nodes) {
+        if (count >= 120 || !visible(node) || node.hasAttribute('data-glance-continuation')) continue;
+        const tag = node.tagName.toLowerCase();
+        const role = node.getAttribute('role') || '';
+        const rawType = node.getAttribute('type');
+        const type = (rawType || (tag === 'button' ? 'submit' : 'text')).toLowerCase();
+        const isInput = tag === 'input';
+        const isField = tag === 'textarea' || tag === 'select' || role === 'textbox' || node.getAttribute('contenteditable') === 'true' ||
+            (isInput && !['password', 'hidden', 'file', 'button', 'submit', 'reset', 'image'].includes(type));
+        const isButton = tag === 'button' || (isInput && ['button', 'submit'].includes(type)) || ['button', 'menuitem', 'tab', 'option'].includes(role);
+        if (!isField && !isButton) continue;
+        if (tag === 'select' && node.multiple) continue;
+        if (isField && (node.readOnly || type === 'password')) continue;
+        const label = labelFor(node);
+        if (!label) continue;
+
+        let kind = 'field';
+        let fieldKind = '';
+        if (isButton) {
+            const explicitSubmit = type === 'submit' && (Boolean(rawType) || Boolean(node.closest('form')));
+            const popup = node.getAttribute('aria-haspopup');
+            const disclosure = (popup && popup !== 'false') || role === 'tab' || role === 'option' ||
+                node.hasAttribute('aria-expanded') || node.hasAttribute('aria-controls') || disclosurePattern.test(label);
+            kind = explicitSubmit ? 'submit' : disclosure ? 'disclosure' : 'action';
+        } else if (tag === 'textarea') {
+            fieldKind = 'textarea';
+        } else if (tag === 'select') {
+            fieldKind = 'select';
+        } else if (isInput && type === 'checkbox') {
+            fieldKind = 'checkbox';
+        } else if (isInput && type === 'radio') {
+            fieldKind = 'radio';
+        } else {
+            fieldKind = 'text';
+        }
+        const [context, inLayer] = contextFor(node);
+        node.setAttribute('data-glance-live-control', String(count));
+        node.setAttribute('data-glance-live-kind', kind);
+        node.setAttribute('data-glance-live-label', label);
+        if (fieldKind) node.setAttribute('data-glance-live-field-kind', fieldKind);
+        if (context) node.setAttribute('data-glance-live-context', context);
+        if (inLayer) node.setAttribute('data-glance-live-layer', 'true');
+        if (kind === 'field') {
+            const value = ('value' in node ? node.value : node.textContent || '').slice(0, 16384);
+            node.setAttribute('data-glance-live-value', value);
+            if (fieldKind === 'checkbox' || fieldKind === 'radio') {
+                node.setAttribute('data-glance-live-checked', String(Boolean(node.checked)));
+            } else if (fieldKind === 'select') {
+                for (const option of node.options) {
+                    option.setAttribute('data-glance-live-option-disabled', String(option.matches(':disabled')));
+                }
+            }
+        }
         count += 1;
     }
     return count;
@@ -757,6 +1255,49 @@ async fn wait_for_feed_settle(page: &Page, configured_wait_ms: u64) -> Result<()
         }
     }
     Ok(())
+}
+
+async fn wait_for_interaction_settle(
+    page: &Page,
+    configured_wait_ms: u64,
+    minimum: Duration,
+) -> Result<()> {
+    let maximum =
+        Duration::from_millis(configured_wait_ms.clamp(minimum.as_millis() as u64 + 500, 6_000));
+    let stable_for = Duration::from_millis(500);
+    let started = Instant::now();
+    let mut stable_since = started;
+    let mut previous = interaction_metrics(page).await?;
+
+    loop {
+        sleep(Duration::from_millis(150)).await;
+        let current = interaction_metrics(page).await?;
+        if current != previous {
+            previous = current;
+            stable_since = Instant::now();
+        }
+        let elapsed = started.elapsed();
+        if elapsed >= minimum && stable_since.elapsed() >= stable_for {
+            return Ok(());
+        }
+        if elapsed >= maximum {
+            return Ok(());
+        }
+    }
+}
+
+async fn interaction_metrics(page: &Page) -> Result<(String, [usize; 3])> {
+    let fallback = Url::parse("about:blank").expect("valid fallback URL");
+    let url = current_page_url(page, &fallback).await?.to_string();
+    let metrics = page
+        .evaluate(
+            "() => [document.documentElement?.outerHTML.length || 0, document.body?.innerText.length || 0, performance.getEntriesByType('resource').length]",
+        )
+        .await
+        .context("failed to observe the live interaction")?
+        .into_value()
+        .context("secure browser returned invalid interaction metrics")?;
+    Ok((url, metrics))
 }
 
 struct ProfileLease {
@@ -879,9 +1420,17 @@ fn secure_lock_file(path: &Path) -> Result<File> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CompanionProfile, ProfileLease, secure_directory, secure_lock_file,
+        CompanionProfile, ProfileLease, is_scrollable_metrics, secure_directory, secure_lock_file,
         validate_loopback_debug_endpoint,
     };
+
+    #[test]
+    fn scrollability_requires_meaningful_overflow() {
+        assert!(!is_scrollable_metrics([0.0, 800.0, 800.0]));
+        assert!(!is_scrollable_metrics([0.0, 800.0, 832.0]));
+        assert!(is_scrollable_metrics([0.0, 800.0, 833.0]));
+        assert!(!is_scrollable_metrics([0.0, 0.0, 1_000.0]));
+    }
 
     #[test]
     fn only_loopback_debug_endpoints_are_accepted() {

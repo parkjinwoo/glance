@@ -43,6 +43,10 @@ through the existing TUI contracts.
 - Browser-backed continuous feeds with edge-triggered prefetch, virtual-DOM snapshot accumulation,
   duplicate-request suppression, bounded memory, and visible non-blocking progress
 - Allowlisted live-page continuation buttons, with label revalidation immediately before activation
+- General connected-page controls: overlay editing for non-sensitive text/textarea fields, native
+  checkbox/radio toggles, native single-select choice panels, portal dialog/menu projection, direct
+  disclosure activation, confirmation-gated actions/submits, and post-action DOM refresh with
+  field-type/identity/origin/visibility revalidation
 - Floating in-progress/completion feedback for dynamic DOM, feed, and media work
 - Repeated sign-in activation focuses the existing window without resetting authentication polling;
   stable completion confirmation and return-navigation coalescing prevent duplicate flows
@@ -64,7 +68,8 @@ through the existing TUI contracts.
 
 ### P1 — better interaction and accessibility
 
-- Support multi-field GET forms, checkboxes, radio groups, and selects through a form overlay.
+- Extend static-page GET forms beyond the existing single query field; connected Chromium forms
+  already provide structured text, textarea, checkbox, radio, and native select editing.
 - Add opt-in POST forms with password masking, origin warnings, and redirect-correct method
   handling.
 - Extract landmarks, language, headings, and accessible names; add heading/link navigation.
@@ -73,8 +78,8 @@ through the existing TUI contracts.
 
 ### P2 — deeper dynamic web bridge
 
-- Extend the authenticated DevTools session from read-only continuation controls to narrowly
-  scoped, origin-checked form actions; keep security prompts and credential entry inside Chromium.
+- Add richer native constraint-validation summaries to the origin-checked live-control bridge;
+  keep security prompts and credential entry inside Chromium.
 - Add an explicit session-management screen for profile retention, revocation, and site sign-out
   without exporting raw cookie material.
 - Add stable item-identity adapters for highly virtualized feeds where text-level generic
